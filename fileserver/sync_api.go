@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	jwt "github.com/dgrijalva/jwt-go"
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/haiwen/seafile-server/fileserver/blockmgr"
@@ -608,6 +609,49 @@ func getCheckQuotaCB(rsp http.ResponseWriter, r *http.Request) *appError {
 		msg := "Out of quota.\n"
 		return &appError{nil, msg, seafHTTPResNoQuota}
 	}
+
+	return nil
+}
+
+type MyClaims struct {
+	Exp      int64
+	RepoID   string `json:"repo_id"`
+	UserName string `json:"username"`
+}
+
+func (*MyClaims) Valid() error {
+	return nil
+}
+
+func getJWTTokenCB(rsp http.ResponseWriter, r *http.Request) *appError {
+	vars := mux.Vars(r)
+	repoID := vars["repoid"]
+
+	if privateKey == "" {
+		return nil
+	}
+
+	user, appErr := validateToken(r, repoID, false)
+	if appErr != nil {
+		return appErr
+	}
+
+	claims := MyClaims{
+		time.Now().Add(time.Hour * 72).Unix(),
+		repoID,
+		user,
+	}
+
+	token := jwt.NewWithClaims(jwt.GetSigningMethod("HS256"), &claims)
+	tokenString, err := token.SignedString([]byte(privateKey))
+	if err != nil {
+		err := fmt.Errorf("failed to gen jwt token for repo %s", repoID)
+		return &appError{err, "", http.StatusInternalServerError}
+	}
+
+	data := fmt.Sprintf("{\"jwt_token\":\"%s\"}", tokenString)
+
+	rsp.Write([]byte(data))
 
 	return nil
 }
