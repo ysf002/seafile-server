@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime"
 	"mime/multipart"
 	"net"
@@ -30,12 +29,14 @@ import (
 	"sort"
 	"syscall"
 
+	"github.com/gorilla/mux"
 	"github.com/haiwen/seafile-server/fileserver/blockmgr"
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
 	"github.com/haiwen/seafile-server/fileserver/diff"
 	"github.com/haiwen/seafile-server/fileserver/fsmgr"
 	"github.com/haiwen/seafile-server/fileserver/option"
 	"github.com/haiwen/seafile-server/fileserver/repomgr"
+	"github.com/haiwen/seafile-server/fileserver/utils"
 	log "github.com/sirupsen/logrus"
 	"golang.org/x/text/unicode/norm"
 )
@@ -84,6 +85,7 @@ func parseContentType(fileName string) string {
 	parts := strings.Split(fileName, ".")
 	if len(parts) >= 2 {
 		suffix := parts[len(parts)-1]
+		suffix = strings.ToLower(suffix)
 		switch suffix {
 		case "txt":
 			contentType = "text/plain"
@@ -107,6 +109,12 @@ func parseContentType(fileName string) string {
 			contentType = "video/mpeg"
 		case "mp4":
 			contentType = "video/mp4"
+		case "ogv":
+			contentType = "video/ogg"
+		case "mov":
+			contentType = "video/mp4"
+		case "webm":
+			contentType = "video/webm"
 		case "jpeg", "JPEG", "jpg", "JPG":
 			contentType = "image/jpeg"
 		case "png", "PNG":
@@ -115,6 +123,20 @@ func parseContentType(fileName string) string {
 			contentType = "image/gif"
 		case "svg", "SVG":
 			contentType = "image/svg+xml"
+		case "heic":
+			contentType = "image/heic"
+		case "ico":
+			contentType = "image/x-icon"
+		case "bmp":
+			contentType = "image/bmp"
+		case "tif", "tiff":
+			contentType = "image/tiff"
+		case "psd":
+			contentType = "image/vnd.adobe.photoshop"
+		case "webp":
+			contentType = "image/webp"
+		case "jfif":
+			contentType = "image/jpeg"
 		}
 	}
 
@@ -230,6 +252,142 @@ func parseCryptKey(rsp http.ResponseWriter, repoID string, user string, version 
 	return seafileKey, nil
 }
 
+func accessV2CB(rsp http.ResponseWriter, r *http.Request) *appError {
+	vars := mux.Vars(r)
+	repoID := vars["repoid"]
+	filePath := vars["filepath"]
+
+	if filePath == "" {
+		msg := "No file path\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	rpath := getCanonPath(filePath)
+	fileName := filepath.Base(rpath)
+
+	op := r.URL.Query().Get("op")
+	if op != "view" && op != "download" {
+		msg := "Operation is neither view or download\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	token := utils.GetAuthorizationToken(r.Header)
+	cookie := r.Header.Get("Cookie")
+
+	if token == "" && cookie == "" {
+		msg := "Both token and cookie are not set\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	ipAddr := getClientIPAddr(r)
+	userAgent := r.Header.Get("User-Agent")
+	user, appErr := checkFileAccess(repoID, token, cookie, filePath, "download", ipAddr, userAgent)
+	if appErr != nil {
+		return appErr
+	}
+
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		msg := "Bad repo id"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	fileID, _, err := fsmgr.GetObjIDByPath(repo.StoreID, repo.RootID, rpath)
+	if err != nil {
+		msg := "Invalid file_path\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	etag := r.Header.Get("If-None-Match")
+	if etag == fileID {
+		return &appError{nil, "", http.StatusNotModified}
+	}
+
+	rsp.Header().Set("ETag", fileID)
+	rsp.Header().Set("Cache-Control", "private, no-cache")
+
+	ranges := r.Header["Range"]
+	byteRanges := strings.Join(ranges, "")
+
+	var cryptKey *seafileCrypt
+	if repo.IsEncrypted {
+		key, err := parseCryptKey(rsp, repoID, user, repo.EncVersion)
+		if err != nil {
+			return err
+		}
+		cryptKey = key
+	}
+
+	exists, _ := fsmgr.Exists(repo.StoreID, fileID)
+	if !exists {
+		msg := "Invalid file id"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	if !repo.IsEncrypted && len(byteRanges) != 0 {
+		if err := doFileRange(rsp, r, repo, fileID, fileName, op, byteRanges, user); err != nil {
+			return err
+		}
+	} else if err := doFile(rsp, r, repo, fileID, fileName, op, cryptKey, user); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type UserInfo struct {
+	User string `json:"user"`
+}
+
+func checkFileAccess(repoID, token, cookie, filePath, op, ipAddr, userAgent string) (string, *appError) {
+	tokenString, err := utils.GenSeahubJWTToken()
+	if err != nil {
+		err := fmt.Errorf("failed to sign jwt token: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+	url := fmt.Sprintf("%s/repos/%s/check-access/", option.SeahubURL, repoID)
+	header := map[string][]string{
+		"Authorization": {"Token " + tokenString},
+	}
+	if cookie != "" {
+		header["Cookie"] = []string{cookie}
+	}
+	req := make(map[string]string)
+	req["op"] = op
+	req["path"] = filePath
+	if token != "" {
+		req["token"] = token
+	}
+	if ipAddr != "" {
+		req["ip_addr"] = ipAddr
+	}
+	if userAgent != "" {
+		req["user_agent"] = userAgent
+	}
+	msg, err := json.Marshal(req)
+	if err != nil {
+		err := fmt.Errorf("failed to encode access token: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+	status, body, err := utils.HttpCommon("POST", url, header, bytes.NewReader(msg))
+	if err != nil {
+		if status != http.StatusInternalServerError {
+			return "", &appError{nil, string(body), status}
+		} else {
+			err := fmt.Errorf("failed to get access token info: %v", err)
+			return "", &appError{err, "", http.StatusInternalServerError}
+		}
+	}
+
+	info := new(UserInfo)
+	err = json.Unmarshal(body, &info)
+	if err != nil {
+		err := fmt.Errorf("failed to decode access token info: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+
+	return info.User, nil
+}
+
 func doFile(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, fileID string,
 	fileName string, operation string, cryptKey *seafileCrypt, user string) *appError {
 	file, err := fsmgr.GetSeafile(repo.StoreID, fileID)
@@ -276,29 +434,24 @@ func doFile(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, fileID
 		err := blockmgr.Read(repo.StoreID, blkID, rsp)
 		if err != nil {
 			if !isNetworkErr(err) {
-				log.Printf("failed to read block %s: %v", blkID, err)
+				log.Errorf("failed to read block %s: %v", blkID, err)
 			}
 			return nil
 		}
 	}
 
-	if operation != "view" {
-		oper := "web-file-download"
-		if operation == "download-link" {
-			oper = "link-file-download"
-		}
-		sendStatisticMsg(repo.StoreID, user, oper, file.FileSize)
+	oper := "web-file-download"
+	if operation == "download-link" {
+		oper = "link-file-download"
 	}
+	sendStatisticMsg(repo.StoreID, user, oper, file.FileSize)
 
 	return nil
 }
 
 func isNetworkErr(err error) bool {
 	_, ok := err.(net.Error)
-	if ok {
-		return true
-	}
-	return false
+	return ok
 }
 
 type blockMap struct {
@@ -394,7 +547,7 @@ func doFileRange(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, f
 			err := blockmgr.Read(repo.StoreID, blkID, &buf)
 			if err != nil {
 				if !isNetworkErr(err) {
-					log.Printf("failed to read block %s: %v", blkID, err)
+					log.Errorf("failed to read block %s: %v", blkID, err)
 				}
 				return nil
 			}
@@ -406,7 +559,7 @@ func doFileRange(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, f
 		err := blockmgr.Read(repo.StoreID, blkID, &buf)
 		if err != nil {
 			if !isNetworkErr(err) {
-				log.Printf("failed to read block %s: %v", blkID, err)
+				log.Errorf("failed to read block %s: %v", blkID, err)
 			}
 			return nil
 		}
@@ -428,7 +581,7 @@ func doFileRange(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, f
 			err := blockmgr.Read(repo.StoreID, blkID, &buf)
 			if err != nil {
 				if !isNetworkErr(err) {
-					log.Printf("failed to read block %s: %v", blkID, err)
+					log.Errorf("failed to read block %s: %v", blkID, err)
 				}
 				return nil
 			}
@@ -442,7 +595,7 @@ func doFileRange(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, f
 			err := blockmgr.Read(repo.StoreID, blkID, rsp)
 			if err != nil {
 				if !isNetworkErr(err) {
-					log.Printf("failed to read block %s: %v", blkID, err)
+					log.Errorf("failed to read block %s: %v", blkID, err)
 				}
 				return nil
 			}
@@ -513,7 +666,7 @@ func setCommonHeaders(rsp http.ResponseWriter, r *http.Request, operation, fileN
 	fileType := parseContentType(fileName)
 	if fileType != "" {
 		var contentType string
-		if strings.Index(fileType, "text") != -1 {
+		if strings.Contains(fileType, "text") {
 			contentType = fileType + "; " + "charset=gbk"
 		} else {
 			contentType = fileType
@@ -528,9 +681,9 @@ func setCommonHeaders(rsp http.ResponseWriter, r *http.Request, operation, fileN
 		operation == "downloadblks" {
 		// Since the file name downloaded by safari will be garbled, we need to encode the filename.
 		// Safari cannot parse unencoded utf8 characters.
-		contFileName = fmt.Sprintf("attachment;filename*=\"utf-8' '%s\"", url.PathEscape(fileName))
+		contFileName = fmt.Sprintf("attachment;filename*=utf-8''%s;filename=\"%s\"", url.PathEscape(fileName), fileName)
 	} else {
-		contFileName = fmt.Sprintf("inline;filename*=\"utf-8' '%s\"", url.PathEscape(fileName))
+		contFileName = fmt.Sprintf("inline;filename*=utf-8''%s;filename=\"%s\"", url.PathEscape(fileName), fileName)
 	}
 	rsp.Header().Set("Content-Disposition", contFileName)
 
@@ -634,7 +787,7 @@ func doBlock(rsp http.ResponseWriter, r *http.Request, repo *repomgr.Repo, fileI
 	err = blockmgr.Read(repo.StoreID, blkID, rsp)
 	if err != nil {
 		if !isNetworkErr(err) {
-			log.Printf("failed to read block %s: %v", blkID, err)
+			log.Errorf("failed to read block %s: %v", blkID, err)
 		}
 	}
 
@@ -726,13 +879,13 @@ func downloadZipFile(rsp http.ResponseWriter, r *http.Request, data, repoID, use
 
 		// The zip name downloaded by safari will be garbled if we encode the zip name,
 		// because we download zip file using chunk encoding.
-		contFileName := fmt.Sprintf("attachment;filename=\"%s\"", zipName)
+		contFileName := fmt.Sprintf("attachment;filename=\"%s\";filename*=utf-8''%s", zipName, url.PathEscape(zipName))
 		rsp.Header().Set("Content-Disposition", contFileName)
 		rsp.Header().Set("Content-Type", "application/octet-stream")
 
 		err := packDir(ar, repo, objID, dirName, cryptKey)
 		if err != nil {
-			log.Printf("failed to pack dir %s: %v", dirName, err)
+			log.Errorf("failed to pack dir %s: %v", dirName, err)
 			return nil
 		}
 	} else {
@@ -745,22 +898,25 @@ func downloadZipFile(rsp http.ResponseWriter, r *http.Request, data, repoID, use
 		zipName := fmt.Sprintf("documents-export-%d-%d-%d.zip", now.Year(), now.Month(), now.Day())
 
 		setCommonHeaders(rsp, r, "download", zipName)
-		contFileName := fmt.Sprintf("attachment;filename=\"%s\"", zipName)
+		contFileName := fmt.Sprintf("attachment;filename=\"%s\";filename*=utf8''%s", zipName, url.PathEscape(zipName))
 		rsp.Header().Set("Content-Disposition", contFileName)
 		rsp.Header().Set("Content-Type", "application/octet-stream")
 
+		fileList := []string{}
 		for _, v := range dirList {
+			uniqueName := genUniqueFileName(v.Name, fileList)
+			fileList = append(fileList, uniqueName)
 			if fsmgr.IsDir(v.Mode) {
-				if err := packDir(ar, repo, v.ID, v.Name, cryptKey); err != nil {
+				if err := packDir(ar, repo, v.ID, uniqueName, cryptKey); err != nil {
 					if !isNetworkErr(err) {
-						log.Printf("failed to pack dir %s: %v", v.Name, err)
+						log.Errorf("failed to pack dir %s: %v", v.Name, err)
 					}
 					return nil
 				}
 			} else {
-				if err := packFiles(ar, &v, repo, "", cryptKey); err != nil {
+				if err := packFiles(ar, &v, repo, "", uniqueName, cryptKey); err != nil {
 					if !isNetworkErr(err) {
-						log.Printf("failed to pack file %s: %v", v.Name, err)
+						log.Errorf("failed to pack file %s: %v", v.Name, err)
 					}
 					return nil
 				}
@@ -769,6 +925,39 @@ func downloadZipFile(rsp http.ResponseWriter, r *http.Request, data, repoID, use
 	}
 
 	return nil
+}
+
+func genUniqueFileName(fileName string, fileList []string) string {
+	var uniqueName string
+	var name string
+	i := 1
+	dot := strings.LastIndex(fileName, ".")
+	if dot < 0 {
+		name = fileName
+	} else {
+		name = fileName[:dot]
+	}
+	uniqueName = fileName
+
+	for nameInFileList(uniqueName, fileList) {
+		if dot < 0 {
+			uniqueName = fmt.Sprintf("%s (%d)", name, i)
+		} else {
+			uniqueName = fmt.Sprintf("%s (%d).%s", name, i, fileName[dot+1:])
+		}
+		i++
+	}
+
+	return uniqueName
+}
+
+func nameInFileList(fileName string, fileList []string) bool {
+	for _, name := range fileList {
+		if name == fileName {
+			return true
+		}
+	}
+	return false
 }
 
 func parseDirFilelist(repo *repomgr.Repo, obj map[string]interface{}) ([]fsmgr.SeafDirent, error) {
@@ -803,14 +992,28 @@ func parseDirFilelist(repo *repomgr.Repo, obj map[string]interface{}) ([]fsmgr.S
 			err := fmt.Errorf("invalid download multi data")
 			return nil, err
 		}
-
-		v, ok := direntHash[name]
-		if !ok {
-			err := fmt.Errorf("invalid download multi data")
+		if name == "" {
+			err := fmt.Errorf("invalid download file name")
 			return nil, err
 		}
 
-		direntList = append(direntList, v)
+		if strings.Contains(name, "/") {
+			rpath := filepath.Join(parentDir, name)
+			dent, err := fsmgr.GetDirentByPath(repo.StoreID, repo.RootID, rpath)
+			if err != nil {
+				err := fmt.Errorf("failed to get path %s for repo %s: %v", rpath, repo.StoreID, err)
+				return nil, err
+			}
+			direntList = append(direntList, *dent)
+		} else {
+			v, ok := direntHash[name]
+			if !ok {
+				err := fmt.Errorf("invalid download multi data")
+				return nil, err
+			}
+
+			direntList = append(direntList, v)
+		}
 	}
 
 	return direntList, nil
@@ -845,7 +1048,7 @@ func packDir(ar *zip.Writer, repo *repomgr.Repo, dirID, dirPath string, cryptKey
 				return err
 			}
 		} else {
-			if err := packFiles(ar, v, repo, dirPath, cryptKey); err != nil {
+			if err := packFiles(ar, v, repo, dirPath, v.Name, cryptKey); err != nil {
 				return err
 			}
 		}
@@ -854,14 +1057,14 @@ func packDir(ar *zip.Writer, repo *repomgr.Repo, dirID, dirPath string, cryptKey
 	return nil
 }
 
-func packFiles(ar *zip.Writer, dirent *fsmgr.SeafDirent, repo *repomgr.Repo, parentPath string, cryptKey *seafileCrypt) error {
+func packFiles(ar *zip.Writer, dirent *fsmgr.SeafDirent, repo *repomgr.Repo, parentPath, baseName string, cryptKey *seafileCrypt) error {
 	file, err := fsmgr.GetSeafile(repo.StoreID, dirent.ID)
 	if err != nil {
 		err := fmt.Errorf("failed to get seafile : %v", err)
 		return err
 	}
 
-	filePath := filepath.Join(parentPath, dirent.Name)
+	filePath := filepath.Join(parentPath, baseName)
 	filePath = strings.TrimLeft(filePath, "/")
 
 	fileHeader := new(zip.FileHeader)
@@ -1003,6 +1206,15 @@ func doUpload(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
 
+	lastModifyStr := normalizeUTF8Path(r.FormValue("last_modify"))
+	var lastModify int64
+	if lastModifyStr != "" {
+		t, err := time.Parse(time.RFC3339, lastModifyStr)
+		if err == nil {
+			lastModify = t.Unix()
+		}
+	}
+
 	relativePath := normalizeUTF8Path(r.FormValue("relative_path"))
 	if relativePath != "" {
 		if relativePath[0] == '/' || relativePath[0] == '\\' {
@@ -1042,10 +1254,7 @@ func doUpload(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		if fsm.rend != fsm.fsize-1 {
 			rsp.Header().Set("Content-Type", "application/json; charset=utf-8")
 			success := "{\"success\": true}"
-			_, err := rsp.Write([]byte(success))
-			if err != nil {
-				log.Printf("failed to write data to response")
-			}
+			rsp.Write([]byte(success))
 
 			return nil
 		}
@@ -1115,7 +1324,7 @@ func doUpload(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 	}
 
 	if err := postMultiFiles(rsp, r, repoID, newParentDir, user, fsm,
-		replaceExisted, isAjax); err != nil {
+		replaceExisted, lastModify, isAjax); err != nil {
 		return err
 	}
 
@@ -1170,7 +1379,7 @@ func writeBlockDataToTmpFile(r *http.Request, fsm *recvData, formFiles map[strin
 	tmpFile, err := repomgr.GetUploadTmpFile(repoID, filePath)
 	if err != nil || tmpFile == "" {
 		tmpDir := filepath.Join(httpTempDir, "cluster-shared")
-		f, err = ioutil.TempFile(tmpDir, filename)
+		f, err = os.CreateTemp(tmpDir, filename)
 		if err != nil {
 			return err
 		}
@@ -1267,7 +1476,7 @@ func mkdirWithParents(repoID, parentDir, newDirPath, user string) error {
 	}
 
 	buf := fmt.Sprintf("Added directory \"%s\"", relativeDirCan)
-	_, err = genNewCommit(repo, headCommit, rootID, user, buf, true)
+	_, err = genNewCommit(repo, headCommit, rootID, user, buf, true, "", false)
 	if err != nil {
 		err := fmt.Errorf("failed to generate new commit: %v", err)
 		return err
@@ -1383,8 +1592,6 @@ func clearTmpFile(fsm *recvData, parentDir string) {
 		}
 		repomgr.DelUploadTmpFile(fsm.repoID, filePath)
 	}
-
-	return
 }
 
 func parseUploadHeaders(r *http.Request) (*recvData, *appError) {
@@ -1460,7 +1667,7 @@ func parseUploadHeaders(r *http.Request) (*recvData, *appError) {
 	return fsm, nil
 }
 
-func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user string, fsm *recvData, replace bool, isAjax bool) *appError {
+func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user string, fsm *recvData, replace bool, lastModify int64, isAjax bool) *appError {
 
 	fileNames := fsm.fileNames
 	files := fsm.files
@@ -1484,7 +1691,7 @@ func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir,
 			return &appError{nil, msg, http.StatusBadRequest}
 		}
 	}
-	if strings.Index(parentDir, "//") != -1 {
+	if strings.Contains(parentDir, "//") {
 		msg := "parent_dir contains // sequence.\n"
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
@@ -1496,6 +1703,12 @@ func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir,
 			return err
 		}
 		cryptKey = key
+	}
+
+	gcID, err := repomgr.GetCurrentGCID(repo.StoreID)
+	if err != nil {
+		err := fmt.Errorf("failed to get current gc id for repo %s: %v", repoID, err)
+		return &appError{err, "", http.StatusInternalServerError}
 	}
 
 	var ids []string
@@ -1528,10 +1741,14 @@ func postMultiFiles(rsp http.ResponseWriter, r *http.Request, repoID, parentDir,
 		}
 	}
 
-	retStr, err := postFilesAndGenCommit(fileNames, repo.ID, user, canonPath, replace, ids, sizes)
+	retStr, err := postFilesAndGenCommit(fileNames, repo.ID, user, canonPath, replace, ids, sizes, lastModify, gcID)
 	if err != nil {
-		err := fmt.Errorf("failed to post files and gen commit: %v", err)
-		return &appError{err, "", http.StatusInternalServerError}
+		if errors.Is(err, ErrGCConflict) {
+			return &appError{nil, "GC Conflict.\n", http.StatusConflict}
+		} else {
+			err := fmt.Errorf("failed to post files and gen commit: %v", err)
+			return &appError{err, "", http.StatusInternalServerError}
+		}
 	}
 
 	_, ok := r.Form["ret-json"]
@@ -1584,7 +1801,11 @@ func checkFilesWithSameName(repo *repomgr.Repo, canonPath string, fileNames []st
 	return false
 }
 
-func postFilesAndGenCommit(fileNames []string, repoID string, user, canonPath string, replace bool, ids []string, sizes []int64) (string, error) {
+func postFilesAndGenCommit(fileNames []string, repoID string, user, canonPath string, replace bool, ids []string, sizes []int64, lastModify int64, lastGCID string) (string, error) {
+	handleConncurrentUpdate := true
+	if !replace {
+		handleConncurrentUpdate = false
+	}
 	repo := repomgr.Get(repoID)
 	if repo == nil {
 		err := fmt.Errorf("failed to get repo %s", repoID)
@@ -1604,7 +1825,10 @@ func postFilesAndGenCommit(fileNames []string, repoID string, user, canonPath st
 			break
 		}
 		mode := (syscall.S_IFREG | 0644)
-		mtime := time.Now().Unix()
+		mtime := lastModify
+		if mtime <= 0 {
+			mtime = time.Now().Unix()
+		}
 		dent := fsmgr.NewDirent(ids[i], name, uint32(mode), mtime, "", sizes[i])
 		dents = append(dents, dent)
 	}
@@ -1623,10 +1847,10 @@ retry:
 		buf = fmt.Sprintf("Added \"%s\".", fileNames[0])
 	}
 
-	_, err = genNewCommit(repo, headCommit, rootID, user, buf, false)
+	_, err = genNewCommit(repo, headCommit, rootID, user, buf, handleConncurrentUpdate, lastGCID, true)
 	if err != nil {
 		if err != ErrConflict {
-			err := fmt.Errorf("failed to generate new commit: %v", err)
+			err := fmt.Errorf("failed to generate new commit: %w", err)
 			return "", err
 		}
 		retryCnt++
@@ -1685,9 +1909,12 @@ func getCanonPath(p string) string {
 	return filepath.Join(formatPath)
 }
 
-var ErrConflict = fmt.Errorf("Concurent upload conflict")
+var (
+	ErrConflict   = errors.New("Concurent upload conflict")
+	ErrGCConflict = errors.New("GC Conflict")
+)
 
-func genNewCommit(repo *repomgr.Repo, base *commitmgr.Commit, newRoot, user, desc string, retryOnConflict bool) (string, error) {
+func genNewCommit(repo *repomgr.Repo, base *commitmgr.Commit, newRoot, user, desc string, handleConncurrentUpdate bool, lastGCID string, checkGC bool) (string, error) {
 	var retryCnt int
 	repoID := repo.ID
 	commit := commitmgr.NewCommit(repoID, base.CommitID, newRoot, user, desc)
@@ -1702,14 +1929,14 @@ func genNewCommit(repo *repomgr.Repo, base *commitmgr.Commit, newRoot, user, des
 	maxRetryCnt := 10
 
 	for {
-		retry, err := genCommitNeedRetry(repo, base, commit, newRoot, user, &commitID)
+		retry, err := genCommitNeedRetry(repo, base, commit, newRoot, user, handleConncurrentUpdate, &commitID, lastGCID, checkGC)
 		if err != nil {
 			return "", err
 		}
 		if !retry {
 			break
 		}
-		if !retryOnConflict {
+		if !handleConncurrentUpdate {
 			return "", ErrConflict
 		}
 
@@ -1732,10 +1959,19 @@ func genNewCommit(repo *repomgr.Repo, base *commitmgr.Commit, newRoot, user, des
 	return commitID, nil
 }
 
-func fastForwardOrMerge(user string, repo *repomgr.Repo, base, newCommit *commitmgr.Commit) error {
+func fastForwardOrMerge(user, token string, repo *repomgr.Repo, base, newCommit *commitmgr.Commit) error {
 	var retryCnt int
+	checkGC, err := repomgr.HasLastGCID(repo.ID, token)
+	if err != nil {
+		return err
+	}
+	var lastGCID string
+	if checkGC {
+		lastGCID, _ = repomgr.GetLastGCID(repo.ID, token)
+		repomgr.RemoveLastGCID(repo.ID, token)
+	}
 	for {
-		retry, err := genCommitNeedRetry(repo, base, newCommit, newCommit.RootID, user, nil)
+		retry, err := genCommitNeedRetry(repo, base, newCommit, newCommit.RootID, user, true, nil, lastGCID, checkGC)
 		if err != nil {
 			return err
 		}
@@ -1755,7 +1991,7 @@ func fastForwardOrMerge(user string, repo *repomgr.Repo, base, newCommit *commit
 	return nil
 }
 
-func genCommitNeedRetry(repo *repomgr.Repo, base *commitmgr.Commit, commit *commitmgr.Commit, newRoot, user string, commitID *string) (bool, error) {
+func genCommitNeedRetry(repo *repomgr.Repo, base *commitmgr.Commit, commit *commitmgr.Commit, newRoot, user string, handleConncurrentUpdate bool, commitID *string, lastGCID string, checkGC bool) (bool, error) {
 	var secondParentID string
 	repoID := repo.ID
 	var mergeDesc string
@@ -1767,6 +2003,9 @@ func genCommitNeedRetry(repo *repomgr.Repo, base *commitmgr.Commit, commit *comm
 	}
 
 	if base.CommitID != currentHead.CommitID {
+		if !handleConncurrentUpdate {
+			return false, ErrConflict
+		}
 		roots := []string{base.RootID, currentHead.RootID, newRoot}
 		opt := new(mergeOptions)
 		opt.remoteRepoID = repoID
@@ -1779,11 +2018,11 @@ func genCommitNeedRetry(repo *repomgr.Repo, base *commitmgr.Commit, commit *comm
 		}
 
 		if !opt.conflict {
-			mergeDesc = fmt.Sprintf("Auto merge by system")
+			mergeDesc = "Auto merge by system"
 		} else {
 			mergeDesc = genMergeDesc(repo, opt.mergedRoot, currentHead.RootID, newRoot)
 			if mergeDesc == "" {
-				mergeDesc = fmt.Sprintf("Auto merge by system")
+				mergeDesc = "Auto merge by system"
 			}
 		}
 
@@ -1805,7 +2044,10 @@ func genCommitNeedRetry(repo *repomgr.Repo, base *commitmgr.Commit, commit *comm
 		mergedCommit = commit
 	}
 
-	err = updateBranch(repoID, mergedCommit.CommitID, currentHead.CommitID, secondParentID)
+	gcConflict, err := updateBranch(repoID, repo.StoreID, mergedCommit.CommitID, currentHead.CommitID, secondParentID, checkGC, lastGCID)
+	if gcConflict {
+		return false, err
+	}
 	if err != nil {
 		return true, nil
 	}
@@ -1828,54 +2070,76 @@ func genMergeDesc(repo *repomgr.Repo, mergedRoot, p1Root, p2Root string) string 
 	return desc
 }
 
-func updateBranch(repoID, newCommitID, oldCommitID, secondParentID string) error {
-	var commitID string
-	name := "master"
-	var sqlStr string
-	if strings.EqualFold(dbType, "mysql") {
-		sqlStr = "SELECT commit_id FROM Branch WHERE name = ? AND repo_id = ? FOR UPDATE"
-	} else {
-		sqlStr = "SELECT commit_id FROM Branch WHERE name = ? AND repo_id = ?"
-	}
-
-	trans, err := seafileDB.Begin()
+func updateBranch(repoID, originRepoID, newCommitID, oldCommitID, secondParentID string, checkGC bool, lastGCID string) (gcConflict bool, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), option.DBOpTimeout)
+	defer cancel()
+	trans, err := seafileDB.BeginTx(ctx, nil)
 	if err != nil {
 		err := fmt.Errorf("failed to start transaction: %v", err)
-		return err
+		return false, err
 	}
-	row := trans.QueryRow(sqlStr, name, repoID)
+
+	var row *sql.Row
+	var sqlStr string
+	if checkGC {
+		sqlStr = "SELECT gc_id FROM GCID WHERE repo_id = ? FOR UPDATE"
+		if originRepoID == "" {
+			row = trans.QueryRowContext(ctx, sqlStr, repoID)
+		} else {
+			row = trans.QueryRowContext(ctx, sqlStr, originRepoID)
+		}
+		var gcID sql.NullString
+		if err := row.Scan(&gcID); err != nil {
+			if err != sql.ErrNoRows {
+				trans.Rollback()
+				return false, err
+			}
+		}
+
+		if lastGCID != gcID.String {
+			err = fmt.Errorf("Head branch update for repo %s conflicts with GC.", repoID)
+			trans.Rollback()
+			return true, ErrGCConflict
+		}
+	}
+
+	var commitID string
+	name := "master"
+	sqlStr = "SELECT commit_id FROM Branch WHERE name = ? AND repo_id = ? FOR UPDATE"
+
+	row = trans.QueryRowContext(ctx, sqlStr, name, repoID)
 	if err := row.Scan(&commitID); err != nil {
 		if err != sql.ErrNoRows {
 			trans.Rollback()
-			return err
+			return false, err
 		}
 	}
 	if oldCommitID != commitID {
 		trans.Rollback()
 		err := fmt.Errorf("head commit id has changed")
-		return err
+		return false, err
 	}
 
 	sqlStr = "UPDATE Branch SET commit_id = ? WHERE name = ? AND repo_id = ?"
-	_, err = trans.Exec(sqlStr, newCommitID, name, repoID)
+	_, err = trans.ExecContext(ctx, sqlStr, newCommitID, name, repoID)
 	if err != nil {
 		trans.Rollback()
-		return err
+		return false, err
 	}
 
 	trans.Commit()
 
 	if secondParentID != "" {
 		if err := onBranchUpdated(repoID, secondParentID, false); err != nil {
-			return err
+			return false, err
 		}
 	}
 
 	if err := onBranchUpdated(repoID, newCommitID, true); err != nil {
-		return err
+		return false, err
 	}
 
-	return nil
+	return false, nil
 }
 
 func onBranchUpdated(repoID string, commitID string, updateRepoInfo bool) error {
@@ -1918,51 +2182,27 @@ func notifRepoUpdate(repoID string, commitID string) error {
 	event.Content = content
 	msg, err := json.Marshal(event)
 	if err != nil {
-		log.Printf("failed to encode repo update event: %v", err)
+		log.Errorf("failed to encode repo update event: %v", err)
 		return err
 	}
 
 	url := fmt.Sprintf("http://%s/events", option.NotificationURL)
-	token, err := genJWTToken(repoID, "")
+	exp := time.Now().Add(time.Second * 300).Unix()
+	token, err := utils.GenNotifJWTToken(repoID, "", exp)
 	if err != nil {
-		log.Printf("failed to generate jwt token: %v", err)
+		log.Errorf("failed to generate jwt token: %v", err)
 		return err
 	}
 	header := map[string][]string{
-		"Seafile-Repo-Token": {token},
-		"Content-Type":       {"application/json"},
+		"Authorization": {"Token " + token},
 	}
-	_, _, err = httpCommon("POST", url, header, bytes.NewReader(msg))
+	_, _, err = utils.HttpCommon("POST", url, header, bytes.NewReader(msg))
 	if err != nil {
-		log.Printf("failed to send repo update event: %v", err)
+		log.Warnf("failed to send repo update event: %v", err)
 		return err
 	}
 
 	return nil
-}
-
-func httpCommon(method, url string, header map[string][]string, reader io.Reader) (int, []byte, error) {
-	req, err := http.NewRequest(method, url, reader)
-	if err != nil {
-		return -1, nil, err
-	}
-	req.Header = header
-
-	rsp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return -1, nil, err
-	}
-	defer rsp.Body.Close()
-
-	if rsp.StatusCode != http.StatusOK {
-		return rsp.StatusCode, nil, fmt.Errorf("bad response %d for %s", rsp.StatusCode, url)
-	}
-	body, err := io.ReadAll(rsp.Body)
-	if err != nil {
-		return rsp.StatusCode, nil, err
-	}
-
-	return rsp.StatusCode, body, nil
 }
 
 func doPostMultiFiles(repo *repomgr.Repo, rootID, parentDir string, dents []*fsmgr.SeafDirent, user string, replace bool, names *[]string) (string, error) {
@@ -2093,7 +2333,7 @@ func genUniqueName(fileName string, entries []*fsmgr.SeafDirent) string {
 	var uniqueName string
 	var name string
 	i := 1
-	dot := strings.Index(fileName, ".")
+	dot := strings.LastIndex(fileName, ".")
 	if dot < 0 {
 		name = fileName
 	} else {
@@ -2126,9 +2366,23 @@ func nameExists(entries []*fsmgr.SeafDirent, fileName string) bool {
 	return false
 }
 
+func shouldIgnore(fileName string) bool {
+	parts := strings.Split(fileName, "/")
+	for _, name := range parts {
+		if name == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 func shouldIgnoreFile(fileName string) bool {
+	if shouldIgnore(fileName) {
+		return true
+	}
+
 	if !utf8.ValidString(fileName) {
-		log.Printf("file name %s contains non-UTF8 characters, skip", fileName)
+		log.Warnf("file name %s contains non-UTF8 characters, skip", fileName)
 		return true
 	}
 
@@ -2136,7 +2390,7 @@ func shouldIgnoreFile(fileName string) bool {
 		return true
 	}
 
-	if strings.Index(fileName, "/") != -1 {
+	if strings.Contains(fileName, "/") {
 		return true
 	}
 
@@ -2261,7 +2515,7 @@ type chunkingResult struct {
 func createChunkPool(ctx context.Context, n int, chunkJobs chan chunkingData, res chan chunkingResult) {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("panic: %v\n%s", err, debug.Stack())
+			log.Errorf("panic: %v\n%s", err, debug.Stack())
 		}
 	}()
 	var wg sync.WaitGroup
@@ -2276,7 +2530,7 @@ func createChunkPool(ctx context.Context, n int, chunkJobs chan chunkingData, re
 func chunkingWorker(ctx context.Context, wg *sync.WaitGroup, chunkJobs chan chunkingData, res chan chunkingResult) {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("panic: %v\n%s", err, debug.Stack())
+			log.Errorf("panic: %v\n%s", err, debug.Stack())
 		}
 	}()
 	for job := range chunkJobs {
@@ -2324,7 +2578,7 @@ func chunkFile(job chunkingData) (string, error) {
 		defer f.Close()
 		file = f
 	}
-	_, err := file.Seek(offset, os.SEEK_SET)
+	_, err := file.Seek(offset, io.SeekStart)
 	if err != nil {
 		err := fmt.Errorf("failed to seek file: %v", err)
 		return "", err
@@ -2437,11 +2691,7 @@ func checkParentDir(repoID string, parentDir string) *appError {
 func isParentMatched(uploadDir, parentDir string) bool {
 	uploadCanon := filepath.Join("/", uploadDir)
 	parentCanon := filepath.Join("/", parentDir)
-	if uploadCanon != parentCanon {
-		return false
-	}
-
-	return true
+	return uploadCanon == parentCanon
 }
 
 func parseContentRange(ranges string, fsm *recvData) bool {
@@ -2554,9 +2804,9 @@ func updateDir(repoID, dirPath, newDirID, user, headID string) (string, error) {
 	if dirPath == "/" {
 		commitDesc := genCommitDesc(repo, newDirID, headCommit.RootID)
 		if commitDesc == "" {
-			commitDesc = fmt.Sprintf("Auto merge by system")
+			commitDesc = "Auto merge by system"
 		}
-		newCommitID, err := genNewCommit(repo, headCommit, newDirID, user, commitDesc, true)
+		newCommitID, err := genNewCommit(repo, headCommit, newDirID, user, commitDesc, true, "", false)
 		if err != nil {
 			err := fmt.Errorf("failed to generate new commit: %v", err)
 			return "", err
@@ -2594,10 +2844,10 @@ func updateDir(repoID, dirPath, newDirID, user, headID string) (string, error) {
 
 	commitDesc := genCommitDesc(repo, rootID, headCommit.RootID)
 	if commitDesc == "" {
-		commitDesc = fmt.Sprintf("Auto merge by system")
+		commitDesc = "Auto merge by system"
 	}
 
-	newCommitID, err := genNewCommit(repo, headCommit, rootID, user, commitDesc, true)
+	newCommitID, err := genNewCommit(repo, headCommit, rootID, user, commitDesc, true, "", false)
 	if err != nil {
 		err := fmt.Errorf("failed to generate new commit: %v", err)
 		return "", err
@@ -2763,6 +3013,15 @@ func doUpdate(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
 
+	lastModifyStr := normalizeUTF8Path(r.FormValue("last_modify"))
+	var lastModify int64
+	if lastModifyStr != "" {
+		t, err := time.Parse(time.RFC3339, lastModifyStr)
+		if err == nil {
+			lastModify = t.Unix()
+		}
+	}
+
 	parentDir := filepath.Dir(targetFile)
 	fileName := filepath.Base(targetFile)
 
@@ -2796,10 +3055,7 @@ func doUpdate(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		if fsm.rend != fsm.fsize-1 {
 			rsp.Header().Set("Content-Type", "application/json; charset=utf-8")
 			success := "{\"success\": true}"
-			_, err := rsp.Write([]byte(success))
-			if err != nil {
-				log.Printf("failed to write data to response.\n")
-			}
+			rsp.Write([]byte(success))
 
 			return nil
 		}
@@ -2869,7 +3125,7 @@ func doUpdate(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 		headID = headIDs[0]
 	}
 
-	if err := putFile(rsp, r, repoID, parentDir, user, fileName, fsm, headID, isAjax); err != nil {
+	if err := putFile(rsp, r, repoID, parentDir, user, fileName, fsm, headID, lastModify, isAjax); err != nil {
 		return err
 	}
 
@@ -2879,7 +3135,7 @@ func doUpdate(rsp http.ResponseWriter, r *http.Request, fsm *recvData, isAjax bo
 	return nil
 }
 
-func putFile(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user, fileName string, fsm *recvData, headID string, isAjax bool) *appError {
+func putFile(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user, fileName string, fsm *recvData, headID string, lastModify int64, isAjax bool) *appError {
 	files := fsm.files
 	repo := repomgr.Get(repoID)
 	if repo == nil {
@@ -2909,7 +3165,7 @@ func putFile(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user, 
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
 
-	if strings.Index(parentDir, "//") != -1 {
+	if strings.Contains(parentDir, "//") {
 		msg := "parent_dir contains // sequence.\n"
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
@@ -2927,6 +3183,12 @@ func putFile(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user, 
 			return err
 		}
 		cryptKey = key
+	}
+
+	gcID, err := repomgr.GetCurrentGCID(repo.StoreID)
+	if err != nil {
+		err := fmt.Errorf("failed to get current gc id: %v", err)
+		return &appError{err, "", http.StatusInternalServerError}
 	}
 
 	var fileID string
@@ -2974,6 +3236,9 @@ func putFile(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user, 
 	}
 
 	mtime := time.Now().Unix()
+	if lastModify > 0 {
+		mtime = lastModify
+	}
 	mode := (syscall.S_IFREG | 0644)
 	newDent := fsmgr.NewDirent(fileID, fileName, uint32(mode), mtime, user, size)
 
@@ -2985,10 +3250,14 @@ func putFile(rsp http.ResponseWriter, r *http.Request, repoID, parentDir, user, 
 	}
 
 	desc := fmt.Sprintf("Modified \"%s\"", fileName)
-	_, err = genNewCommit(repo, headCommit, rootID, user, desc, true)
+	_, err = genNewCommit(repo, headCommit, rootID, user, desc, true, gcID, true)
 	if err != nil {
-		err := fmt.Errorf("failed to generate new commit: %v", err)
-		return &appError{err, "", http.StatusInternalServerError}
+		if errors.Is(err, ErrGCConflict) {
+			return &appError{nil, "GC Conflict.\n", http.StatusConflict}
+		} else {
+			err := fmt.Errorf("failed to generate new commit: %v", err)
+			return &appError{err, "", http.StatusInternalServerError}
+		}
 	}
 
 	if isAjax {
@@ -3086,6 +3355,15 @@ func doUploadBlks(rsp http.ResponseWriter, r *http.Request, fsm *recvData) *appE
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
 
+	lastModifyStr := normalizeUTF8Path(r.FormValue("last_modify"))
+	var lastModify int64
+	if lastModifyStr != "" {
+		t, err := time.Parse(time.RFC3339, lastModifyStr)
+		if err == nil {
+			lastModify = t.Unix()
+		}
+	}
+
 	fileName := normalizeUTF8Path(r.FormValue("file_name"))
 	if fileName == "" {
 		msg := "No file_name given.\n"
@@ -3124,7 +3402,7 @@ func doUploadBlks(rsp http.ResponseWriter, r *http.Request, fsm *recvData) *appE
 		return &appError{nil, msg, http.StatusBadRequest}
 	}
 
-	fileID, appErr := commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user, fileSize, replaceExisted)
+	fileID, appErr := commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user, fileSize, replaceExisted, lastModify)
 	if appErr != nil {
 		return appErr
 	}
@@ -3150,7 +3428,7 @@ func doUploadBlks(rsp http.ResponseWriter, r *http.Request, fsm *recvData) *appE
 	return nil
 }
 
-func commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user string, fileSize int64, replace bool) (string, *appError) {
+func commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user string, fileSize int64, replace bool, lastModify int64) (string, *appError) {
 	repo := repomgr.Get(repoID)
 	if repo == nil {
 		msg := "Failed to get repo.\n"
@@ -3172,7 +3450,7 @@ func commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user string, fi
 		return "", &appError{nil, msg, http.StatusBadRequest}
 	}
 
-	if strings.Index(parentDir, "//") != -1 {
+	if strings.Contains(parentDir, "//") {
 		msg := "parent_dir contains // sequence.\n"
 		return "", &appError{nil, msg, http.StatusBadRequest}
 	}
@@ -3189,12 +3467,21 @@ func commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user string, fi
 		return "", appErr
 	}
 
+	gcID, err := repomgr.GetCurrentGCID(repo.StoreID)
+	if err != nil {
+		err := fmt.Errorf("failed to get current gc id: %v", err)
+		return "", &appError{err, "", http.StatusInternalServerError}
+	}
+
 	fileID, appErr := indexExistedFileBlocks(repoID, repo.Version, blkIDs, fileSize)
 	if appErr != nil {
 		return "", appErr
 	}
 
 	mtime := time.Now().Unix()
+	if lastModify > 0 {
+		mtime = lastModify
+	}
 	mode := (syscall.S_IFREG | 0644)
 	newDent := fsmgr.NewDirent(fileID, fileName, uint32(mode), mtime, user, fileSize)
 	var names []string
@@ -3205,10 +3492,14 @@ func commitFileBlocks(repoID, parentDir, fileName, blockIDsJSON, user string, fi
 	}
 
 	desc := fmt.Sprintf("Added \"%s\"", fileName)
-	_, err = genNewCommit(repo, headCommit, rootID, user, desc, true)
+	_, err = genNewCommit(repo, headCommit, rootID, user, desc, true, gcID, true)
 	if err != nil {
-		err := fmt.Errorf("failed to generate new commit: %v", err)
-		return "", &appError{err, "", http.StatusInternalServerError}
+		if errors.Is(err, ErrGCConflict) {
+			return "", &appError{nil, "GC Conflict.\n", http.StatusConflict}
+		} else {
+			err := fmt.Errorf("failed to generate new commit: %v", err)
+			return "", &appError{err, "", http.StatusInternalServerError}
+		}
 	}
 
 	return fileID, nil
@@ -3377,6 +3668,395 @@ func indexRawBlocks(repoID string, blockIDs []string, fileHeaders []*multipart.F
 
 	return nil
 }
+
+/*
+func uploadLinkCB(rsp http.ResponseWriter, r *http.Request) *appError {
+	if seahubPK == "" {
+		err := fmt.Errorf("no seahub private key is configured")
+		return &appError{err, "", http.StatusNotFound}
+	}
+	if r.Method == "OPTIONS" {
+		setAccessControl(rsp)
+		rsp.WriteHeader(http.StatusOK)
+		return nil
+	}
+
+	fsm, err := parseUploadLinkHeaders(r)
+	if err != nil {
+		return err
+	}
+
+	if err := doUpload(rsp, r, fsm, false); err != nil {
+		formatJSONError(rsp, err)
+		return err
+	}
+
+	return nil
+}
+
+func parseUploadLinkHeaders(r *http.Request) (*recvData, *appError) {
+	tokenLen := 36
+	parts := strings.Split(r.URL.Path[1:], "/")
+	if len(parts) < 2 {
+		msg := "Invalid URL"
+		return nil, &appError{nil, msg, http.StatusBadRequest}
+	}
+	if len(parts[1]) < tokenLen {
+		msg := "Invalid URL"
+		return nil, &appError{nil, msg, http.StatusBadRequest}
+	}
+	token := parts[1][:tokenLen]
+
+	info, appErr := queryShareLinkInfo(token, "upload")
+	if appErr != nil {
+		return nil, appErr
+	}
+
+	repoID := info.RepoID
+	parentDir := normalizeUTF8Path(info.ParentDir)
+
+	status, err := repomgr.GetRepoStatus(repoID)
+	if err != nil {
+		return nil, &appError{err, "", http.StatusInternalServerError}
+	}
+	if status != repomgr.RepoStatusNormal && status != -1 {
+		msg := "Repo status not writable."
+		return nil, &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	user, _ := repomgr.GetRepoOwner(repoID)
+
+	fsm := new(recvData)
+
+	fsm.parentDir = parentDir
+	fsm.tokenType = "upload-link"
+	fsm.repoID = repoID
+	fsm.user = user
+	fsm.rstart = -1
+	fsm.rend = -1
+	fsm.fsize = -1
+
+	ranges := r.Header.Get("Content-Range")
+	if ranges != "" {
+		parseContentRange(ranges, fsm)
+	}
+
+	return fsm, nil
+}
+*/
+
+type ShareLinkInfo struct {
+	RepoID    string `json:"repo_id"`
+	FilePath  string `json:"file_path"`
+	ParentDir string `json:"parent_dir"`
+	ShareType string `json:"share_type"`
+}
+
+func queryShareLinkInfo(token, cookie, opType, ipAddr, userAgent string) (*ShareLinkInfo, *appError) {
+	tokenString, err := utils.GenSeahubJWTToken()
+	if err != nil {
+		err := fmt.Errorf("failed to sign jwt token: %v", err)
+		return nil, &appError{err, "", http.StatusInternalServerError}
+	}
+	url := fmt.Sprintf("%s?type=%s", option.SeahubURL+"/check-share-link-access/", opType)
+	header := map[string][]string{
+		"Authorization": {"Token " + tokenString},
+	}
+	if cookie != "" {
+		header["Cookie"] = []string{cookie}
+	}
+	req := make(map[string]string)
+	req["token"] = token
+	if ipAddr != "" {
+		req["ip_addr"] = ipAddr
+	}
+	if userAgent != "" {
+		req["user_agent"] = userAgent
+	}
+	msg, err := json.Marshal(req)
+	if err != nil {
+		err := fmt.Errorf("failed to encode access token: %v", err)
+		return nil, &appError{err, "", http.StatusInternalServerError}
+	}
+	status, body, err := utils.HttpCommon("POST", url, header, bytes.NewReader(msg))
+	if err != nil {
+		if status != http.StatusInternalServerError {
+			return nil, &appError{nil, string(body), status}
+		} else {
+			err := fmt.Errorf("failed to get share link info: %v", err)
+			return nil, &appError{err, "", http.StatusInternalServerError}
+		}
+	}
+
+	info := new(ShareLinkInfo)
+	err = json.Unmarshal(body, &info)
+	if err != nil {
+		err := fmt.Errorf("failed to decode share link info: %v", err)
+		return nil, &appError{err, "", http.StatusInternalServerError}
+	}
+
+	return info, nil
+}
+
+func accessLinkCB(rsp http.ResponseWriter, r *http.Request) *appError {
+	if option.JWTPrivateKey == "" {
+		err := fmt.Errorf("no seahub private key is configured")
+		return &appError{err, "", http.StatusNotFound}
+	}
+
+	parts := strings.Split(r.URL.Path[1:], "/")
+	if len(parts) < 2 {
+		msg := "Invalid URL"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	token := parts[1]
+	cookie := r.Header.Get("Cookie")
+	ipAddr := getClientIPAddr(r)
+	userAgent := r.Header.Get("User-Agent")
+	info, appErr := queryShareLinkInfo(token, cookie, "file", ipAddr, userAgent)
+	if appErr != nil {
+		return appErr
+	}
+
+	if info.FilePath == "" {
+		msg := "Internal server error\n"
+		err := fmt.Errorf("failed to get file_path by token %s", token)
+		return &appError{err, msg, http.StatusInternalServerError}
+	}
+	if info.ShareType != "f" {
+		msg := "Link type mismatch"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	repoID := info.RepoID
+	filePath := normalizeUTF8Path(info.FilePath)
+	fileName := filepath.Base(filePath)
+
+	op := r.URL.Query().Get("op")
+	if op != "view" {
+		op = "download-link"
+	}
+
+	ranges := r.Header["Range"]
+	byteRanges := strings.Join(ranges, "")
+
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		msg := "Bad repo id\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	user, _ := repomgr.GetRepoOwner(repoID)
+
+	fileID, _, err := fsmgr.GetObjIDByPath(repo.StoreID, repo.RootID, filePath)
+	if err != nil {
+		msg := "Invalid file_path\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	// Check for file changes by comparing the ETag in the If-None-Match header with the file ID. Set no-cache to allow clients to validate file changes before using the cache.
+	etag := r.Header.Get("If-None-Match")
+	if etag == fileID {
+		return &appError{nil, "", http.StatusNotModified}
+	}
+
+	rsp.Header().Set("ETag", fileID)
+	rsp.Header().Set("Cache-Control", "public, no-cache")
+
+	var cryptKey *seafileCrypt
+	if repo.IsEncrypted {
+		key, err := parseCryptKey(rsp, repoID, user, repo.EncVersion)
+		if err != nil {
+			return err
+		}
+		cryptKey = key
+	}
+
+	exists, _ := fsmgr.Exists(repo.StoreID, fileID)
+	if !exists {
+		msg := "Invalid file id"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	if !repo.IsEncrypted && len(byteRanges) != 0 {
+		if err := doFileRange(rsp, r, repo, fileID, fileName, op, byteRanges, user); err != nil {
+			return err
+		}
+	} else if err := doFile(rsp, r, repo, fileID, fileName, op, cryptKey, user); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+/*
+func accessDirLinkCB(rsp http.ResponseWriter, r *http.Request) *appError {
+	if seahubPK == "" {
+		err := fmt.Errorf("no seahub private key is configured")
+		return &appError{err, "", http.StatusNotFound}
+	}
+
+	parts := strings.Split(r.URL.Path[1:], "/")
+	if len(parts) < 2 {
+		msg := "Invalid URL"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	token := parts[1]
+	info, appErr := queryShareLinkInfo(token, "dir")
+	if appErr != nil {
+		return appErr
+	}
+
+	repoID := info.RepoID
+	parentDir := normalizeUTF8Path(info.ParentDir)
+	op := "download-link"
+
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		msg := "Bad repo id\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	user, _ := repomgr.GetRepoOwner(repoID)
+
+	filePath := r.URL.Query().Get("p")
+	if filePath == "" {
+		err := r.ParseForm()
+		if err != nil {
+			msg := "Invalid form\n"
+			return &appError{nil, msg, http.StatusBadRequest}
+		}
+		parentDir := r.FormValue("parent_dir")
+		if parentDir == "" {
+			msg := "Invalid parent_dir\n"
+			return &appError{nil, msg, http.StatusBadRequest}
+		}
+		parentDir = normalizeUTF8Path(parentDir)
+		parentDir = getCanonPath(parentDir)
+		dirents := r.FormValue("dirents")
+		if dirents == "" {
+			msg := "Invalid dirents\n"
+			return &appError{nil, msg, http.StatusBadRequest}
+		}
+		// opStr:=r.FormVale("op")
+		list, err := jsonToDirentList(repo, parentDir, dirents)
+		if err != nil {
+			log.Warnf("failed to parse dirent list: %v", err)
+			msg := "Invalid dirents\n"
+			return &appError{nil, msg, http.StatusBadRequest}
+		}
+		if len(list) == 0 {
+			msg := "Invalid dirents\n"
+			return &appError{nil, msg, http.StatusBadRequest}
+		}
+
+		obj := make(map[string]interface{})
+		if len(list) == 1 {
+			dent := list[0]
+			op = "download-dir-link"
+			obj["dir_name"] = dent.Name
+			obj["obj_id"] = dent.ID
+		} else {
+			op = "download-multi-link"
+			obj["parent_dir"] = parentDir
+			var fileList []string
+			for _, dent := range list {
+				fileList = append(fileList, dent.Name)
+			}
+			obj["file_list"] = fileList
+		}
+		data, err := json.Marshal(obj)
+		if err != nil {
+			err := fmt.Errorf("failed to encode zip obj: %v", err)
+			return &appError{err, "", http.StatusInternalServerError}
+		}
+		if err := downloadZipFile(rsp, r, string(data), repoID, user, op); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// file path is not empty string
+	if _, ok := r.Header["If-Modified-Since"]; ok {
+		return &appError{nil, "", http.StatusNotModified}
+	}
+
+	filePath = normalizeUTF8Path(filePath)
+	fullPath := filepath.Join(parentDir, filePath)
+	fileName := filepath.Base(filePath)
+
+	fileID, _, err := fsmgr.GetObjIDByPath(repo.StoreID, repo.RootID, fullPath)
+	if err != nil {
+		msg := "Invalid file_path\n"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+	rsp.Header().Set("ETag", fileID)
+
+	now := time.Now()
+	rsp.Header().Set("Last-Modified", now.Format("Mon, 2 Jan 2006 15:04:05 GMT"))
+	rsp.Header().Set("Cache-Control", "max-age=3600")
+
+	ranges := r.Header["Range"]
+	byteRanges := strings.Join(ranges, "")
+
+	var cryptKey *seafileCrypt
+	if repo.IsEncrypted {
+		key, err := parseCryptKey(rsp, repoID, user, repo.EncVersion)
+		if err != nil {
+			return err
+		}
+		cryptKey = key
+	}
+
+	exists, _ := fsmgr.Exists(repo.StoreID, fileID)
+	if !exists {
+		msg := "Invalid file id"
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
+	if !repo.IsEncrypted && len(byteRanges) != 0 {
+		if err := doFileRange(rsp, r, repo, fileID, fileName, op, byteRanges, user); err != nil {
+			return err
+		}
+	} else if err := doFile(rsp, r, repo, fileID, fileName, op, cryptKey, user); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func jsonToDirentList(repo *repomgr.Repo, parentDir, dirents string) ([]*fsmgr.SeafDirent, error) {
+	var list []string
+	err := json.Unmarshal([]byte(dirents), &list)
+	if err != nil {
+		return nil, err
+	}
+
+	dir, err := fsmgr.GetSeafdirByPath(repo.StoreID, repo.RootID, parentDir)
+	if err != nil {
+		return nil, err
+	}
+
+	direntHash := make(map[string]*fsmgr.SeafDirent)
+	for _, dent := range dir.Entries {
+		direntHash[dent.Name] = dent
+	}
+
+	var direntList []*fsmgr.SeafDirent
+	for _, path := range list {
+		normPath := normalizeUTF8Path(path)
+		if normPath == "" || normPath == "/" {
+			return nil, fmt.Errorf("Invalid download file name: %s\n", normPath)
+		}
+		dent, ok := direntHash[normPath]
+		if !ok {
+			return nil, fmt.Errorf("failed to get dient for %s in dir %s in repo %s", normPath, parentDir, repo.StoreID)
+		}
+		direntList = append(direntList, dent)
+	}
+
+	return direntList, nil
+}
+*/
 
 func removeFileopExpireCache() {
 	deleteBlockMaps := func(key interface{}, value interface{}) bool {

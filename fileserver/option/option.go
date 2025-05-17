@@ -3,9 +3,11 @@ package option
 import (
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/ini.v1"
 )
@@ -26,7 +28,6 @@ var (
 	Host                   string
 	Port                   uint32
 	MaxUploadSize          uint64
-	MaxDownloadDirSize     uint64
 	FsIdListRequestTimeout int64
 	// Block size for indexing uploaded files
 	FixedBlockSize uint64
@@ -38,6 +39,7 @@ var (
 	WindowsEncoding           string
 	SkipBlockHash             bool
 	FsCacheLimit              int64
+	VerifyClientBlocks        bool
 
 	// general options
 	CloudMode bool
@@ -45,8 +47,6 @@ var (
 	// notification server
 	EnableNotification bool
 	NotificationURL    string
-	// notification options
-	PrivateKey string
 
 	// GROUP options
 	GroupTableName string
@@ -54,25 +54,47 @@ var (
 	// quota options
 	DefaultQuota int64
 
+	// redis options
+	HasRedisOptions bool
+	RedisHost       string
+	RedisPasswd     string
+	RedisPort       uint32
+	RedisExpiry     uint32
+	RedisMaxConn    uint32
+	RedisTimeout    time.Duration
+
 	// Profile password
 	ProfilePassword string
 	EnableProfiling bool
 
 	// Go log level
 	LogLevel string
+
+	// DB default timeout
+	DBOpTimeout time.Duration
+
+	// seahub
+	SeahubURL     string
+	JWTPrivateKey string
 )
 
 func initDefaultOptions() {
 	Host = "0.0.0.0"
 	Port = 8082
-	MaxDownloadDirSize = 100 * (1 << 20)
 	FixedBlockSize = 1 << 23
 	MaxIndexingThreads = 1
 	WebTokenExpireTime = 7200
 	ClusterSharedTempFileMode = 0600
 	DefaultQuota = InfiniteQuota
-	FsCacheLimit = 2 << 30
+	FsCacheLimit = 4 << 30
+	VerifyClientBlocks = true
 	FsIdListRequestTimeout = -1
+	DBOpTimeout = 60 * time.Second
+	RedisHost = "127.0.0.1"
+	RedisPort = 6379
+	RedisExpiry = 24 * 3600
+	RedisMaxConn = 100
+	RedisTimeout = 1 * time.Second
 }
 
 func LoadFileServerOptions(centralDir string) {
@@ -93,34 +115,10 @@ func LoadFileServerOptions(centralDir string) {
 		}
 	}
 
-	if section, err := config.GetSection("notification"); err == nil {
-		if key, err := section.GetKey("enabled"); err == nil {
-			EnableNotification, _ = key.Bool()
-		}
-	}
-
-	if EnableNotification {
-		var notifServer string
-		var notifPort uint32
-		if section, err := config.GetSection("notification"); err == nil {
-			if key, err := section.GetKey("jwt_private_key"); err == nil {
-				PrivateKey = key.String()
-			}
-		}
-		if section, err := config.GetSection("notification"); err == nil {
-			if key, err := section.GetKey("host"); err == nil {
-				notifServer = key.String()
-			}
-		}
-		if section, err := config.GetSection("notification"); err == nil {
-			if key, err := section.GetKey("port"); err == nil {
-				port, err := key.Uint()
-				if err == nil {
-					notifPort = uint32(port)
-				}
-			}
-		}
-		NotificationURL = fmt.Sprintf("%s:%d", notifServer, notifPort)
+	notifServer := os.Getenv("NOTIFICATION_SERVER_URL")
+	if notifServer != "" {
+		NotificationURL = fmt.Sprintf("%s:8083", notifServer)
+		EnableNotification = true
 	}
 
 	if section, err := config.GetSection("httpserver"); err == nil {
@@ -137,16 +135,11 @@ func LoadFileServerOptions(centralDir string) {
 		}
 	}
 
-	ccnetConfPath := filepath.Join(centralDir, "ccnet.conf")
-	config, err = ini.Load(ccnetConfPath)
-	if err != nil {
-		log.Fatalf("Failed to load ccnet.conf: %v", err)
-	}
-	GroupTableName = "Group"
-	if section, err := config.GetSection("GROUP"); err == nil {
-		if key, err := section.GetKey("TABLE_NAME"); err == nil {
-			GroupTableName = key.String()
-		}
+	loadCacheOptionFromEnv()
+
+	GroupTableName = os.Getenv("SEAFILE_MYSQL_DB_GROUP_TABLE_NAME")
+	if GroupTableName == "" {
+		GroupTableName = "Group"
 	}
 }
 
@@ -163,7 +156,7 @@ func parseFileServerSection(section *ini.Section) {
 	if key, err := section.GetKey("max_upload_size"); err == nil {
 		size, err := key.Uint()
 		if err == nil {
-			MaxUploadSize = uint64(size) * (1 << 20)
+			MaxUploadSize = uint64(size) * 1000000
 		}
 	}
 	if key, err := section.GetKey("max_indexing_threads"); err == nil {
@@ -209,11 +202,18 @@ func parseFileServerSection(section *ini.Section) {
 			FsCacheLimit = fsCacheLimit * 1024 * 1024
 		}
 	}
+	// The ratio of physical memory consumption and fs objects is about 4:1,
+	// and this part of memory is generally not subject to GC. So the value is
+	// divided by 4.
+	FsCacheLimit = FsCacheLimit / 4
 	if key, err := section.GetKey("fs_id_list_request_timeout"); err == nil {
 		fsIdListRequestTimeout, err := key.Int64()
 		if err == nil {
 			FsIdListRequestTimeout = fsIdListRequestTimeout
 		}
+	}
+	if key, err := section.GetKey("verify_client_blocks_after_sync"); err == nil {
+		VerifyClientBlocks, _ = key.Bool()
 	}
 }
 
@@ -257,4 +257,59 @@ func parseQuota(quotaStr string) int64 {
 	}
 
 	return quota
+}
+
+func loadCacheOptionFromEnv() {
+	cacheProvider := os.Getenv("CACHE_PROVIDER")
+	if cacheProvider != "redis" {
+		return
+	}
+
+	HasRedisOptions = true
+
+	redisHost := os.Getenv("REDIS_HOST")
+	if redisHost != "" {
+		RedisHost = redisHost
+	}
+	redisPort := os.Getenv("REDIS_PORT")
+	if redisPort != "" {
+		port, err := strconv.ParseUint(redisPort, 10, 32)
+		if err != nil {
+			RedisPort = uint32(port)
+		}
+	}
+	redisPasswd := os.Getenv("REDIS_PASSWORD")
+	if redisPasswd != "" {
+		RedisPasswd = redisPasswd
+	}
+	redisMaxConn := os.Getenv("REDIS_MAX_CONNECTIONS")
+	if redisMaxConn != "" {
+		maxConn, err := strconv.ParseUint(redisMaxConn, 10, 32)
+		if err != nil {
+			RedisMaxConn = uint32(maxConn)
+		}
+	}
+	redisExpiry := os.Getenv("REDIS_EXPIRY")
+	if redisExpiry != "" {
+		expiry, err := strconv.ParseUint(redisExpiry, 10, 32)
+		if err != nil {
+			RedisExpiry = uint32(expiry)
+		}
+	}
+}
+
+func LoadSeahubConfig() error {
+	JWTPrivateKey = os.Getenv("JWT_PRIVATE_KEY")
+	if JWTPrivateKey == "" {
+		return fmt.Errorf("failed to read JWT_PRIVATE_KEY")
+	}
+
+	siteRoot := os.Getenv("SITE_ROOT")
+	if siteRoot != "" {
+		SeahubURL = fmt.Sprintf("http://127.0.0.1:8000%sapi/v2.1/internal", siteRoot)
+	} else {
+		SeahubURL = "http://127.0.0.1:8000/api/v2.1/internal"
+	}
+
+	return nil
 }

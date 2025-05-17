@@ -9,11 +9,13 @@
 #include "utils.h"
 
 #include "seafile-session.h"
+#include "seaf-utils.h"
 #include "fs-mgr.h"
 #include "repo-mgr.h"
 #include "seafile-error.h"
 #include "seafile-rpc.h"
 #include "mq-mgr.h"
+#include "password-hash.h"
 
 #ifdef SEAFILE_SERVER
 #include "web-accesstoken-mgr.h"
@@ -25,8 +27,6 @@
 
 #define DEBUG_FLAG SEAFILE_DEBUG_OTHER
 #include "log.h"
-
-#define CCNET_ERR_INTERNAL 500
 
 #ifndef SEAFILE_SERVER
 #include "../daemon/vc-utils.h"
@@ -1045,7 +1045,7 @@ retry:
     }
 
     if (repo->pwd_hash_algo) {
-        if (seafile_pwd_hash_verify_repo_passwd (repo_id, old_passwd, repo->salt,
+        if (seafile_pwd_hash_verify_repo_passwd (repo->enc_version, repo_id, old_passwd, repo->salt,
                                                  repo->pwd_hash, repo->pwd_hash_algo, repo->pwd_hash_params) < 0) {
             g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Incorrect password");
             return -1;
@@ -1071,7 +1071,7 @@ retry:
     char new_magic[65], new_pwd_hash[65], new_random_key[97];
 
     if (repo->pwd_hash_algo) {
-        seafile_generate_pwd_hash (repo_id, new_passwd, repo->salt,
+        seafile_generate_pwd_hash (repo->enc_version, repo_id, new_passwd, repo->salt,
                                    repo->pwd_hash_algo, repo->pwd_hash_params, new_pwd_hash);
     } else {
         seafile_generate_magic (repo->enc_version, repo_id, new_passwd, repo->salt,
@@ -1109,7 +1109,8 @@ retry:
     seaf_branch_set_commit (repo->head, commit->commit_id);
     if (seaf_branch_manager_test_and_update_branch (seaf->branch_mgr,
                                                     repo->head,
-                                                    parent->commit_id) < 0) {
+                                                    parent->commit_id,
+                                                    FALSE, NULL, NULL, NULL) < 0) {
         seaf_repo_unref (repo);
         seaf_commit_unref (commit);
         seaf_commit_unref (parent);
@@ -1122,6 +1123,181 @@ retry:
     if (seaf_passwd_manager_is_passwd_set (seaf->passwd_mgr, repo_id, user))
         seaf_passwd_manager_set_passwd (seaf->passwd_mgr, repo_id,
                                         user, new_passwd, error);
+
+out:
+    seaf_commit_unref (commit);
+    seaf_commit_unref (parent);
+    seaf_repo_unref (repo);
+
+    return ret;
+}
+
+static void
+set_pwd_hash_to_commit (SeafCommit *commit,
+                        SeafRepo *repo,
+                        const char *pwd_hash,
+                        const char *pwd_hash_algo,
+                        const char *pwd_hash_params)
+{
+    commit->repo_name = g_strdup (repo->name);
+    commit->repo_desc = g_strdup (repo->desc);
+    commit->encrypted = repo->encrypted;
+    commit->repaired = repo->repaired;
+    if (commit->encrypted) {
+        commit->enc_version = repo->enc_version;
+        if (commit->enc_version == 2) {
+            commit->random_key = g_strdup (repo->random_key);
+        } else if (commit->enc_version == 3) {
+            commit->random_key = g_strdup (repo->random_key);
+            commit->salt = g_strdup (repo->salt);
+        } else if (commit->enc_version == 4) {
+            commit->random_key = g_strdup (repo->random_key);
+            commit->salt = g_strdup (repo->salt);
+        }
+        commit->pwd_hash = g_strdup (pwd_hash);
+        commit->pwd_hash_algo = g_strdup (pwd_hash_algo);
+        commit->pwd_hash_params = g_strdup (pwd_hash_params);
+    }
+    commit->no_local_history = repo->no_local_history;
+    commit->version = repo->version;
+}
+
+int
+seafile_upgrade_repo_pwd_hash_algorithm (const char *repo_id,
+                                         const char *user,
+                                         const char *passwd,
+                                         const char *pwd_hash_algo,
+                                         const char *pwd_hash_params,
+                                         GError **error)
+{
+    SeafRepo *repo = NULL;
+    SeafCommit *commit = NULL, *parent = NULL;
+    int ret = 0;
+
+    if (!user) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "No user given");
+        return -1;
+    }
+
+    if (!passwd || passwd[0] == 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Empty passwd");
+        return -1;
+    }
+
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
+        return -1;
+    }
+
+    if (!pwd_hash_algo) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid pwd hash algorithm");
+        return -1;
+    }
+
+    if (g_strcmp0 (pwd_hash_algo, PWD_HASH_PDKDF2) != 0 &&
+        g_strcmp0 (pwd_hash_algo, PWD_HASH_ARGON2ID) != 0) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Unsupported pwd hash algorithm");
+        return -1;
+    }
+
+    if (!pwd_hash_params) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid pwd hash params");
+        return -1;
+    }
+
+retry:
+    repo = seaf_repo_manager_get_repo (seaf->repo_mgr, repo_id);
+    if (!repo) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "No such library");
+        return -1;
+    }
+
+    if (g_strcmp0 (pwd_hash_algo, repo->pwd_hash_algo) == 0 &&
+        g_strcmp0 (pwd_hash_params, repo->pwd_hash_params) == 0) {
+        goto out;
+    }
+
+    if (!repo->encrypted) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Repo not encrypted");
+        ret = -1;
+        goto out;
+    }
+
+    if (repo->pwd_hash_algo) {
+        if (seafile_pwd_hash_verify_repo_passwd (repo->enc_version, repo_id, passwd, repo->salt,
+                                                 repo->pwd_hash, repo->pwd_hash_algo, repo->pwd_hash_params) < 0) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Incorrect password");
+            ret = 1;
+            goto out;
+        }
+    } else {
+        if (seafile_verify_repo_passwd (repo_id, passwd, repo->magic,
+                                        repo->enc_version, repo->salt) < 0) {
+            g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Incorrect password");
+            ret = -1;
+            goto out;
+        }
+    }
+
+    parent = seaf_commit_manager_get_commit (seaf->commit_mgr,
+                                             repo->id, repo->version,
+                                             repo->head->commit_id);
+    if (!parent) {
+        seaf_warning ("Failed to get commit %s:%s.\n",
+                      repo->id, repo->head->commit_id);
+        ret = -1;
+        goto out;
+    }
+
+    char new_pwd_hash[65]= {0};
+
+    seafile_generate_pwd_hash (repo->enc_version, repo_id, passwd, repo->salt,
+                               pwd_hash_algo, pwd_hash_params, new_pwd_hash);
+
+    // To prevent clients that have already synced this repo from overwriting the modified encryption algorithm,
+    // delete all sync tokens.
+    if (seaf_delete_repo_tokens (repo) < 0) {
+        seaf_warning ("Failed to delete repo sync tokens, abort change pwd hash algorithm.\n");
+        ret = -1;
+        goto out;
+    }
+
+    memcpy (repo->pwd_hash, new_pwd_hash, 64);
+
+    commit = seaf_commit_new (NULL,
+                              repo->id,
+                              parent->root_id,
+                              user,
+                              EMPTY_SHA1,
+                              "Changed library password hash algorithm",
+                              0);
+    commit->parent_id = g_strdup(parent->commit_id);
+    set_pwd_hash_to_commit (commit, repo, new_pwd_hash, pwd_hash_algo, pwd_hash_params);
+
+    if (seaf_commit_manager_add_commit (seaf->commit_mgr, commit) < 0) {
+        ret = -1;
+        goto out;
+    }
+
+    seaf_branch_set_commit (repo->head, commit->commit_id);
+    if (seaf_branch_manager_test_and_update_branch (seaf->branch_mgr,
+                                                    repo->head,
+                                                    parent->commit_id,
+                                                    FALSE, NULL, NULL, NULL) < 0) {
+        seaf_repo_unref (repo);
+        seaf_commit_unref (commit);
+        seaf_commit_unref (parent);
+        repo = NULL;
+        commit = NULL;
+        parent = NULL;
+        goto retry;
+    }
+
+    if (seaf_passwd_manager_is_passwd_set (seaf->passwd_mgr, repo_id, user))
+        seaf_passwd_manager_set_passwd (seaf->passwd_mgr, repo_id,
+                                        user, passwd, error);
 
 out:
     seaf_commit_unref (commit);
@@ -1364,6 +1540,16 @@ seafile_get_repo_history_limit (const char *repo_id,
     }
 
     return  seaf_repo_manager_get_repo_history_limit (seaf->repo_mgr, repo_id);
+}
+
+int
+seafile_set_repo_valid_since (const char *repo_id,
+                              gint64 timestamp,
+                              GError **error)
+{
+    return seaf_repo_manager_set_repo_valid_since (seaf->repo_mgr,
+                                                   repo_id,
+                                                   timestamp);
 }
 
 int
@@ -2548,6 +2734,7 @@ seafile_post_multi_files (const char *repo_id,
                                         paths_json,
                                         user,
                                         replace_existed,
+                                        0,
                                         &ret_json,
                                         NULL,
                                         error);
@@ -2598,6 +2785,7 @@ seafile_put_file (const char *repo_id, const char *temp_file_path,
     seaf_repo_manager_put_file (seaf->repo_mgr, repo_id,
                                 temp_file_path, rpath,
                                 norm_file_name, user, head_id,
+                                0,
                                 &new_file_id, error);
 
 out:
@@ -2805,6 +2993,46 @@ out:
     g_free (norm_parent_dir);
     g_free (norm_file_name);
     g_free (rpath);
+
+    return ret;
+}
+
+int
+seafile_batch_del_files (const char *repo_id,
+                         const char *filepaths,
+                         const char *user,
+                         GError **error)
+{
+    char *norm_file_list = NULL, *rpath = NULL;
+    int ret = 0;
+
+    if (!repo_id || !filepaths || !user) {
+        g_set_error (error, 0, SEAF_ERR_BAD_ARGS, "Argument should not be null");
+        return -1;
+    }
+
+    if (!is_uuid_valid (repo_id)) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS, "Invalid repo id");
+        return -1;
+    }
+
+
+    norm_file_list = normalize_utf8_path (filepaths);
+    if (!norm_file_list) {
+        g_set_error (error, SEAFILE_DOMAIN, SEAF_ERR_BAD_ARGS,
+                     "Path is in valid UTF8 encoding");
+        ret = -1;
+        goto out;
+    }
+
+    if (seaf_repo_manager_batch_del_files (seaf->repo_mgr, repo_id,
+                                           norm_file_list,
+                                           user, error) < 0) {
+        ret = -1;
+    }
+
+out:
+    g_free (norm_file_list);
 
     return ret;
 }
@@ -3645,6 +3873,7 @@ seafile_check_repo_blocks_missing (const char *repo_id,
     free (json_data);
     json_decref (ret_json);
     json_decref (array);
+    seaf_repo_unref (repo);
     return ret;
 }
 
@@ -4667,7 +4896,7 @@ ccnet_rpc_get_emailuser (const char *email, GError **error)
     CcnetUserManager *user_mgr = seaf->user_mgr;
     CcnetEmailUser *emailuser = NULL;
     
-    emailuser = ccnet_user_manager_get_emailuser (user_mgr, email);
+    emailuser = ccnet_user_manager_get_emailuser (user_mgr, email, error);
     
     return (GObject *)emailuser;
 }
@@ -4683,7 +4912,7 @@ ccnet_rpc_get_emailuser_with_import (const char *email, GError **error)
     CcnetUserManager *user_mgr = seaf->user_mgr;
     CcnetEmailUser *emailuser = NULL;
 
-    emailuser = ccnet_user_manager_get_emailuser_with_import (user_mgr, email);
+    emailuser = ccnet_user_manager_get_emailuser_with_import (user_mgr, email, error);
 
     return (GObject *)emailuser;
 }
@@ -5389,7 +5618,7 @@ ccnet_rpc_get_org_emailusers (const char *url_prefix, int start , int limit,
     while (ptr) {
         char *email = ptr->data;
         CcnetEmailUser *emailuser = ccnet_user_manager_get_emailuser (user_mgr,
-                                                                      email);
+                                                                      email, NULL);
         if (emailuser != NULL) {
             ret = g_list_prepend (ret, emailuser);
         }

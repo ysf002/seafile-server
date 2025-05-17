@@ -145,12 +145,14 @@ start_index_task (gpointer data, gpointer user_data)
     GList *ptr = NULL, *id_list = NULL, *size_list = NULL;
     char *path = NULL;
     char *ret_json = NULL;
+    char *gc_id = NULL;
     char hex[41];
     unsigned char sha1[20];
     int ret = 0;
     IdxProgress *progress = idx_para->progress;
     SeafileCrypt *crypt = idx_para->crypt;
 
+    gc_id = seaf_repo_get_current_gc_id(repo);
     gint64 *size;
     for (ptr = idx_para->paths; ptr; ptr = ptr->next) {
         path = ptr->data;
@@ -178,6 +180,8 @@ start_index_task (gpointer data, gpointer user_data)
                                      idx_para->canon_path,
                                      id_list,
                                      size_list,
+                                     0,
+                                     gc_id,
                                      NULL);
     progress->status = ret;
     if (idx_para->ret_json) {
@@ -193,6 +197,7 @@ out:
     g_list_free_full (id_list, g_free);
     g_list_free_full (size_list, g_free);
     free_index_para (idx_para);
+    g_free (gc_id);
     return;
 }
 

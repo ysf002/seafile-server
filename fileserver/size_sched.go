@@ -1,22 +1,33 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
+	"time"
 
 	"gopkg.in/ini.v1"
 
 	"database/sql"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
 	"github.com/haiwen/seafile-server/fileserver/diff"
 	"github.com/haiwen/seafile-server/fileserver/fsmgr"
+	"github.com/haiwen/seafile-server/fileserver/option"
 	"github.com/haiwen/seafile-server/fileserver/repomgr"
 	"github.com/haiwen/seafile-server/fileserver/workerpool"
+
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	RepoSizeList = "repo_size_task"
+)
+
 var updateSizePool *workerpool.WorkPool
+var redisClient *redis.Client
 
 func sizeSchedulerInit() {
 	var n int = 1
@@ -39,6 +50,16 @@ func sizeSchedulerInit() {
 		}
 	}
 	updateSizePool = workerpool.CreateWorkerPool(computeRepoSize, n)
+
+	server := fmt.Sprintf("%s:%d", option.RedisHost, option.RedisPort)
+	opt := &redis.Options{
+		Addr:     server,
+		Password: option.RedisPasswd,
+	}
+	opt.PoolSize = n
+
+	redisClient = redis.NewClient(opt)
+
 }
 
 func computeRepoSize(args ...interface{}) error {
@@ -117,11 +138,18 @@ func computeRepoSize(args ...interface{}) error {
 		return err
 	}
 
+	err = notifyRepoSizeChange(repo.StoreID)
+	if err != nil {
+		log.Warnf("Failed to notify repo size change for repo %s: %v", repoID, err)
+	}
+
 	return nil
 }
 
 func setRepoSizeAndFileCount(repoID, newHeadID string, size, fileCount int64) error {
-	trans, err := seafileDB.Begin()
+	ctx, cancel := context.WithTimeout(context.Background(), option.DBOpTimeout)
+	defer cancel()
+	trans, err := seafileDB.BeginTx(ctx, nil)
 	if err != nil {
 		err := fmt.Errorf("failed to start transaction: %v", err)
 		return err
@@ -130,7 +158,7 @@ func setRepoSizeAndFileCount(repoID, newHeadID string, size, fileCount int64) er
 	var headID string
 	sqlStr := "SELECT head_id FROM RepoSize WHERE repo_id=?"
 
-	row := trans.QueryRow(sqlStr, repoID)
+	row := trans.QueryRowContext(ctx, sqlStr, repoID)
 	if err := row.Scan(&headID); err != nil {
 		if err != sql.ErrNoRows {
 			trans.Rollback()
@@ -140,14 +168,14 @@ func setRepoSizeAndFileCount(repoID, newHeadID string, size, fileCount int64) er
 
 	if headID == "" {
 		sqlStr := "INSERT INTO RepoSize (repo_id, size, head_id) VALUES (?, ?, ?)"
-		_, err = trans.Exec(sqlStr, repoID, size, newHeadID)
+		_, err = trans.ExecContext(ctx, sqlStr, repoID, size, newHeadID)
 		if err != nil {
 			trans.Rollback()
 			return err
 		}
 	} else {
 		sqlStr = "UPDATE RepoSize SET size = ?, head_id = ? WHERE repo_id = ?"
-		_, err = trans.Exec(sqlStr, size, newHeadID, repoID)
+		_, err = trans.ExecContext(ctx, sqlStr, size, newHeadID, repoID)
 		if err != nil {
 			trans.Rollback()
 			return err
@@ -156,7 +184,7 @@ func setRepoSizeAndFileCount(repoID, newHeadID string, size, fileCount int64) er
 
 	var exist int
 	sqlStr = "SELECT 1 FROM RepoFileCount WHERE repo_id=?"
-	row = trans.QueryRow(sqlStr, repoID)
+	row = trans.QueryRowContext(ctx, sqlStr, repoID)
 	if err := row.Scan(&exist); err != nil {
 		if err != sql.ErrNoRows {
 			trans.Rollback()
@@ -166,14 +194,14 @@ func setRepoSizeAndFileCount(repoID, newHeadID string, size, fileCount int64) er
 
 	if exist != 0 {
 		sqlStr := "UPDATE RepoFileCount SET file_count=? WHERE repo_id=?"
-		_, err = trans.Exec(sqlStr, fileCount, repoID)
+		_, err = trans.ExecContext(ctx, sqlStr, fileCount, repoID)
 		if err != nil {
 			trans.Rollback()
 			return err
 		}
 	} else {
 		sqlStr := "INSERT INTO RepoFileCount (repo_id,file_count) VALUES (?,?)"
-		_, err = trans.Exec(sqlStr, repoID, fileCount)
+		_, err = trans.ExecContext(ctx, sqlStr, repoID, fileCount)
 		if err != nil {
 			trans.Rollback()
 			return err
@@ -181,6 +209,33 @@ func setRepoSizeAndFileCount(repoID, newHeadID string, size, fileCount int64) er
 	}
 
 	trans.Commit()
+
+	return nil
+}
+
+type RepoSizeChangeTask struct {
+	RepoID string `json:"repo_id"`
+}
+
+func notifyRepoSizeChange(repoID string) error {
+	if !option.HasRedisOptions {
+		return nil
+	}
+
+	task := &RepoSizeChangeTask{RepoID: repoID}
+
+	data, err := json.Marshal(task)
+	if err != nil {
+		return fmt.Errorf("failed to encode repo size change task: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = redisClient.LPush(ctx, RepoSizeList, data).Err()
+	if err != nil {
+		return fmt.Errorf("failed to push message to redis list %s: %w", RepoSizeList, err)
+	}
 
 	return nil
 }
@@ -197,7 +252,9 @@ func getOldRepoInfo(repoID string) (*RepoInfo, error) {
 		"s.repo_id=f.repo_id WHERE s.repo_id=?"
 
 	repoInfo := new(RepoInfo)
-	row := seafileDB.QueryRow(sqlStr, repoID)
+	ctx, cancel := context.WithTimeout(context.Background(), option.DBOpTimeout)
+	defer cancel()
+	row := seafileDB.QueryRowContext(ctx, sqlStr, repoID)
 	if err := row.Scan(&repoInfo.HeadID, &repoInfo.Size, &repoInfo.FileCount); err != nil {
 		if err != sql.ErrNoRows {
 			return nil, err

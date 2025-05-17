@@ -126,6 +126,11 @@ class SeafServerThreadedRpcClient(NamedPipeClient):
         pass
     del_file = seafile_del_file
 
+    @searpc_func("int", ["string", "string", "string"])
+    def seafile_batch_del_files(repo_id, filepaths, user):
+        pass
+    batch_del_files = seafile_batch_del_files
+
     @searpc_func("object", ["string", "string", "string", "string", "string", "string", "string", "int", "int"])
     def seafile_copy_file(src_repo, src_dir, src_filename, dst_repo, dst_dir, dst_filename, user, need_progress, synchronous):
         pass
@@ -607,6 +612,10 @@ class SeafServerThreadedRpcClient(NamedPipeClient):
     def get_repo_history_limit(repo_id):
         pass
 
+    @searpc_func("int", ["string", "int64"])
+    def set_repo_valid_since(repo_id, timestamp):
+        pass
+
     # virtual repo
     @searpc_func("string", ["string", "string", "string", "string", "string", "string"])
     def create_virtual_repo(origin_repo_id, path, repo_name, repo_desc, owner, passwd=''):
@@ -630,6 +639,12 @@ class SeafServerThreadedRpcClient(NamedPipeClient):
     def seafile_change_repo_passwd(repo_id, old_passwd, new_passwd, user):
         pass
     change_repo_passwd = seafile_change_repo_passwd
+
+    # Upgrade repo enc algorithm
+    @searpc_func("int", ["string", "string", "string", "string", "string"])
+    def seafile_upgrade_repo_pwd_hash_algorithm (repo_id, user, passwd, pwd_hash_algo, pwd_hash_params):
+        pass
+    upgrade_repo_pwd_hash_algorithm = seafile_upgrade_repo_pwd_hash_algorithm
 
     # Clean trash
     @searpc_func("int", ["string", "int"])

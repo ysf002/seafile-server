@@ -9,6 +9,10 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
+#include <jwt.h>
+
+#define JWT_TOKEN_EXPIRE_TIME 3*24*3600 /* 3 days*/
 
 char *
 seafile_session_get_tmp_file_path (SeafileSession *session,
@@ -56,90 +60,185 @@ sqlite_db_start (SeafileSession *session)
 
 #define MYSQL_DEFAULT_PORT 3306
 
-static int
-mysql_db_start (SeafileSession *session)
-{
-    char *host, *user, *passwd, *db, *unix_socket, *charset;
+typedef struct DBOption {
+    char *user;
+    char *passwd;
+    char *host;
+    char *ca_path;
+    char *charset;
+    char *ccnet_db_name;
+    char *seafile_db_name;
+    gboolean use_ssl;
+    gboolean skip_verify;
     int port;
-    gboolean use_ssl = FALSE;
-    gboolean skip_verify = FALSE;
-    char *ca_path = NULL;
-    int max_connections = 0;
-    GError *error = NULL;
+    int max_connections;
+} DBOption;
 
-    unix_socket = seaf_key_file_get_string (session->config, 
-                                         "database", "unix_socket", NULL);
+static void
+db_option_free (DBOption *option)
+{
+    if (!option)
+        return;
+    g_free (option->user);
+    g_free (option->passwd);
+    g_free (option->host);
+    g_free (option->ca_path);
+    g_free (option->charset);
+    g_free (option->ccnet_db_name);
+    g_free (option->seafile_db_name);
+    g_free (option);
+}
 
-    host = seaf_key_file_get_string (session->config, "database", "host", NULL);
-    if (!host && !unix_socket) {
-        seaf_warning ("DB host not set in config.\n");
-        return -1;
+static int
+load_db_option_from_env (DBOption *option)
+{
+    const char *env_user, *env_passwd, *env_host, *env_ccnet_db, *env_seafile_db;
+
+    env_user = g_getenv("SEAFILE_MYSQL_DB_USER");
+    env_passwd = g_getenv("SEAFILE_MYSQL_DB_PASSWORD");
+    env_host = g_getenv("SEAFILE_MYSQL_DB_HOST");
+    env_ccnet_db = g_getenv("SEAFILE_MYSQL_DB_CCNET_DB_NAME");
+    env_seafile_db = g_getenv("SEAFILE_MYSQL_DB_SEAFILE_DB_NAME");
+
+    if (env_user && g_strcmp0 (env_user, "") != 0) {
+        g_free (option->user);
+        option->user = g_strdup (env_user);
+    }
+    if (env_passwd && g_strcmp0 (env_passwd, "") != 0) {
+        g_free (option->passwd);
+        option->passwd = g_strdup (env_passwd);
+    }
+    if (env_host && g_strcmp0 (env_host, "") != 0) {
+        g_free (option->host);
+        option->host = g_strdup (env_host);
+    }
+    if (env_ccnet_db && g_strcmp0 (env_ccnet_db, "") != 0) {
+        g_free (option->ccnet_db_name);
+        option->ccnet_db_name = g_strdup (env_ccnet_db);
+    } else if (!option->ccnet_db_name) {
+        option->ccnet_db_name = g_strdup ("ccnet_db");
+        seaf_message ("Failed to read SEAFILE_MYSQL_DB_CCNET_DB_NAME, use ccnet_db by default");
+    }
+    if (env_seafile_db && g_strcmp0 (env_seafile_db, "") != 0) {
+        g_free (option->seafile_db_name);
+        option->seafile_db_name = g_strdup (env_seafile_db);
+    } else if (!option->seafile_db_name) {
+        option->seafile_db_name = g_strdup ("seafile_db");
+		seaf_message ("Failed to read SEAFILE_MYSQL_DB_SEAFILE_DB_NAME, use seafile_db by default");
     }
 
-    port = g_key_file_get_integer (session->config, "database", "port", &error);
+    return 0;
+}
+
+static DBOption *
+load_db_option (SeafileSession *session)
+{
+    GError *error = NULL;
+    int ret = 0;
+    DBOption *option = g_new0 (DBOption, 1);
+
+    option->host = seaf_key_file_get_string (session->config, "database", "host", NULL);
+
+    option->port = g_key_file_get_integer (session->config, "database", "port", &error);
     if (error) {
         g_clear_error (&error);
-        port = MYSQL_DEFAULT_PORT;
+        option->port = MYSQL_DEFAULT_PORT;
     }
 
-    user = seaf_key_file_get_string (session->config, "database", "user", NULL);
-    if (!user && !unix_socket) {
-        seaf_warning ("DB user not set in config.\n");
-        return -1;
-    }
+    option->user = seaf_key_file_get_string (session->config, "database", "user", NULL);
 
-    passwd = seaf_key_file_get_string (session->config, "database", "password", NULL);
-    if (!passwd && !unix_socket) {
-        seaf_warning ("DB passwd not set in config.\n");
-        return -1;
-    }
+    option->passwd = seaf_key_file_get_string (session->config, "database", "password", NULL);
 
-    db = seaf_key_file_get_string (session->config, "database", "db_name", NULL);
-    if (!db) {
-        seaf_warning ("DB name not set in config.\n");
-        return -1;
-    }
+    option->seafile_db_name = seaf_key_file_get_string (session->config, "database", "db_name", NULL);
 
-    use_ssl = g_key_file_get_boolean (session->config,
+    option->use_ssl = g_key_file_get_boolean (session->config,
                                       "database", "use_ssl", NULL);
 
-    skip_verify = g_key_file_get_boolean (session->config,
+    option->skip_verify = g_key_file_get_boolean (session->config,
                                           "database", "skip_verify", NULL);
 
-    if (use_ssl && !skip_verify) {
-        ca_path = seaf_key_file_get_string (session->config,
+    if (option->use_ssl && !option->skip_verify) {
+        option->ca_path = seaf_key_file_get_string (session->config,
                                             "database", "ca_path", NULL);
-        if (!ca_path) {
+        if (!option->ca_path) {
             seaf_warning ("ca_path is required if use ssl and don't skip verify.\n");
-            return -1;
+            ret = -1;
+            goto out;
         }
     }
 
-    charset = seaf_key_file_get_string (session->config,
+    option->charset = seaf_key_file_get_string (session->config,
                                      "database", "connection_charset", NULL);
 
-    max_connections = g_key_file_get_integer (session->config,
+    option->max_connections = g_key_file_get_integer (session->config,
                                               "database", "max_connections",
                                               &error);
-    if (error || max_connections < 0) {
+    if (error || option->max_connections < 0) {
         if (error)
             g_clear_error (&error);
-        max_connections = DEFAULT_MAX_CONNECTIONS;
+        option->max_connections = DEFAULT_MAX_CONNECTIONS;
     }
 
-    session->db = seaf_db_new_mysql (host, port, user, passwd, db, unix_socket, use_ssl, skip_verify, ca_path, charset, max_connections);
+    load_db_option_from_env (option);
+
+    if (!option->host) {
+        seaf_warning ("DB host not set in config.\n");
+        ret = -1;
+        goto out;
+    }
+
+    if (!option->user) {
+        seaf_warning ("DB user not set in config.\n");
+        ret = -1;
+        goto out;
+    }
+
+    if (!option->passwd) {
+        seaf_warning ("DB passwd not set in config.\n");
+        ret = -1;
+        goto out;
+    }
+
+    if (!option->ccnet_db_name) {
+        seaf_warning ("ccnet_db_name not set in config.\n");
+        ret = -1;
+        goto out;
+    }
+    if (!option->seafile_db_name) {
+        seaf_warning ("db_name not set in config.\n");
+        ret = -1;
+        goto out;
+    }
+
+out:
+    if (ret < 0) {
+        db_option_free (option);
+        return NULL;
+    }
+
+    return option;
+}
+
+static int
+mysql_db_start (SeafileSession *session)
+{
+    DBOption *option = NULL;
+
+    option = load_db_option (session);
+    if (!option) {
+        seaf_warning ("Failed to load database config.\n");
+        return -1;
+    }
+
+    session->db = seaf_db_new_mysql (option->host, option->port, option->user, option->passwd, option->seafile_db_name,
+                                     NULL, option->use_ssl, option->skip_verify, option->ca_path, option->charset, option->max_connections);
     if (!session->db) {
+        db_option_free (option);
         seaf_warning ("Failed to start mysql db.\n");
         return -1;
     }
 
-    g_free (host);
-    g_free (user);
-    g_free (passwd);
-    g_free (db);
-    g_free (unix_socket);
-    g_free (charset);
-
+    db_option_free (option);
     return 0;
 }
 
@@ -214,24 +313,15 @@ load_database_config (SeafileSession *session)
     gboolean create_tables = FALSE;
 
     type = seaf_key_file_get_string (session->config, "database", "type", &error);
-    /* Default to use sqlite if not set. */
-    if (!type || strcasecmp (type, "sqlite") == 0) {
+    /* Default to use mysql if not set. */
+    if (type && strcasecmp (type, "sqlite") == 0) {
         ret = sqlite_db_start (session);
     }
 #ifdef HAVE_MYSQL
-    else if (strcasecmp (type, "mysql") == 0) {
+    else {
         ret = mysql_db_start (session);
     }
 #endif
-#ifdef HAVE_POSTGRESQL
-    else if (strcasecmp (type, "pgsql") == 0) {
-        ret = pgsql_db_start (session);
-    }
-#endif
-    else {
-        seaf_warning ("Unsupported db type %s.\n", type);
-        ret = -1;
-    }
     if (ret == 0) {
         if (g_key_file_has_key (session->config, "database", "create_tables", NULL))
             create_tables = g_key_file_get_boolean (session->config,
@@ -263,80 +353,23 @@ ccnet_init_sqlite_database (SeafileSession *session)
 static int
 ccnet_init_mysql_database (SeafileSession *session)
 {
-    char *host, *user, *passwd, *db, *unix_socket, *charset;
-    int port;
-    gboolean use_ssl = FALSE;
-    gboolean skip_verify = FALSE;
-    char *ca_path = NULL;
-    int max_connections = 0;
+    DBOption *option = NULL;
 
-    host = ccnet_key_file_get_string (session->ccnet_config, "Database", "HOST");
-    user = ccnet_key_file_get_string (session->ccnet_config, "Database", "USER");
-    passwd = ccnet_key_file_get_string (session->ccnet_config, "Database", "PASSWD");
-    db = ccnet_key_file_get_string (session->ccnet_config, "Database", "DB");
-    unix_socket = ccnet_key_file_get_string (session->ccnet_config,
-                                             "Database", "UNIX_SOCKET");
-
-    if (!host && !unix_socket) {
-        seaf_warning ("DB host not set in config.\n");
-        return -1;
-    }
-    if (!user && !unix_socket) {
-        seaf_warning ("DB user not set in config.\n");
-        return -1;
-    }
-    if (!passwd && !unix_socket) {
-        seaf_warning ("DB passwd not set in config.\n");
-        return -1;
-    }
-    if (!db) {
-        seaf_warning ("DB name not set in config.\n");
+    option = load_db_option (session);
+    if (!option) {
+        seaf_warning ("Failed to load database config.\n");
         return -1;
     }
 
-    GError *error = NULL;
-    port = g_key_file_get_integer (session->ccnet_config, "Database", "PORT", &error);
-    if (error) {
-        g_clear_error (&error);
-        port = MYSQL_DEFAULT_PORT;
-    }
-
-    use_ssl = g_key_file_get_boolean (session->ccnet_config, "Database", "USE_SSL", NULL);
-    skip_verify = g_key_file_get_boolean (session->ccnet_config, "Database", "SKIP_VERIFY", NULL);
-    if (use_ssl && !skip_verify) {
-        ca_path = seaf_key_file_get_string (session->ccnet_config,
-                                            "Database", "CA_PATH", NULL);
-        if (!ca_path) {
-            seaf_warning ("ca_path is required if use ssl and don't skip verify.\n");
-            return -1;
-        }
-    }
-
-    charset = ccnet_key_file_get_string (session->ccnet_config,
-                                         "Database", "CONNECTION_CHARSET");
-
-    max_connections = g_key_file_get_integer (session->ccnet_config,
-                                              "Database", "MAX_CONNECTIONS",
-                                              &error);
-    if (error || max_connections < 0) {
-        max_connections = DEFAULT_MAX_CONNECTIONS;
-        if (error)
-            g_clear_error (&error);
-    }
-
-    session->ccnet_db = seaf_db_new_mysql (host, port, user, passwd, db, unix_socket, use_ssl, skip_verify, ca_path, charset, max_connections);
+    session->ccnet_db = seaf_db_new_mysql (option->host, option->port, option->user, option->passwd, option->ccnet_db_name,
+                                           NULL, option->use_ssl, option->skip_verify, option->ca_path, option->charset, option->max_connections);
     if (!session->ccnet_db) {
+        db_option_free (option);
         seaf_warning ("Failed to open ccnet database.\n");
         return -1;
     }
 
-    g_free (host);
-    g_free (user);
-    g_free (passwd);
-    g_free (db);
-    g_free (unix_socket);
-    g_free (charset);
-
+    db_option_free (option);
     return 0;
 }
 
@@ -349,30 +382,20 @@ load_ccnet_database_config (SeafileSession *session)
     char *engine;
     gboolean create_tables = FALSE;
 
-    engine = ccnet_key_file_get_string (session->ccnet_config, "Database", "ENGINE");
-    if (!engine || strcasecmp (engine, "sqlite") == 0) {
+    engine = ccnet_key_file_get_string (session->config, "database", "type");
+    if (engine && strcasecmp (engine, "sqlite") == 0) {
         seaf_message ("Use database sqlite\n");
         ret = ccnet_init_sqlite_database (session);
     }
 #ifdef HAVE_MYSQL
-    else if (strcasecmp (engine, "mysql") == 0) {
+    else {
         seaf_message("Use database Mysql\n");
         ret = ccnet_init_mysql_database (session);
     }
 #endif
-#if 0
-    else if (strncasecmp (engine, DB_PGSQL, sizeof(DB_PGSQL)) == 0) {
-        ccnet_debug ("Use database PostgreSQL\n");
-        ret = init_pgsql_database (session);
-    }
-#endif
-    else {
-        seaf_warning ("Unknown database type: %s.\n", engine);
-        ret = -1;
-    }
     if (ret == 0) {
-        if (g_key_file_has_key (session->ccnet_config, "Database", "CREATE_TABLES", NULL))
-            create_tables = g_key_file_get_boolean (session->ccnet_config, "Database", "CREATE_TABLES", NULL);
+        if (g_key_file_has_key (session->config, "database", "create_tables", NULL))
+            create_tables = g_key_file_get_boolean (session->config, "database", "create_tables", NULL);
         session->ccnet_create_tables = create_tables;
     }
 
@@ -380,128 +403,165 @@ load_ccnet_database_config (SeafileSession *session)
     return ret;
 }
 
-static char *
-parse_seahub_db_config ()
+#ifdef FULL_FEATURE
+
+char *
+seaf_gen_notif_server_jwt (const char *repo_id, const char *username)
 {
-    char buf[1024];
-    GError *error = NULL;
-    int retcode = 0;
-    char *child_stdout = NULL;
-    char *child_stderr = NULL;
+    char *jwt_token = NULL;
+    gint64 now = (gint64)time(NULL);
 
-    char *binary_path = g_find_program_in_path ("parse_seahub_db.py");
+    jwt_t *jwt = NULL;
 
-    snprintf (buf,
-          sizeof(buf),
-          "python3 %s",
-          binary_path);
-    g_spawn_command_line_sync (buf,
-                               &child_stdout,
-                               &child_stderr,
-                               &retcode,
-                               &error);
-
-    if (error != NULL) {
-        seaf_warning ("Failed to run python parse_seahub_db.py: %s\n", error->message);
-        g_free (binary_path);
-        g_free (child_stdout);
-        g_free (child_stderr);
-        g_clear_error (&error);
-        return NULL;
-    }
-    g_spawn_check_exit_status (retcode, &error);
-    if (error != NULL) {
-        seaf_warning ("Failed to run python parse_seahub_db.py: %s\n", error->message);
-        g_free (binary_path);
-        g_free (child_stdout);
-        g_free (child_stderr);
-        g_clear_error (&error);
+    if (!seaf->notif_server_private_key) {
+        seaf_warning ("No private key is configured for generating jwt token\n");
         return NULL;
     }
 
-    g_free (binary_path);
-    g_free (child_stderr);
-    return child_stdout;
+    int ret = jwt_new (&jwt);
+    if (ret != 0 || jwt == NULL) {
+        seaf_warning ("Failed to create jwt\n");
+        goto out;
+    }
+
+    ret = jwt_add_grant (jwt, "repo_id", repo_id);
+    if (ret != 0) {
+        seaf_warning ("Failed to add repo_id to jwt\n");
+        goto out;
+    }
+    ret = jwt_add_grant (jwt, "username", username);
+    if (ret != 0) {
+        seaf_warning ("Failed to add username to jwt\n");
+        goto out;
+    }
+    ret = jwt_add_grant_int (jwt, "exp", now + JWT_TOKEN_EXPIRE_TIME);
+    if (ret != 0) {
+        seaf_warning ("Failed to expire time to jwt\n");
+        goto out;
+    }
+    ret = jwt_set_alg (jwt, JWT_ALG_HS256, (unsigned char *)seaf->notif_server_private_key, strlen(seaf->notif_server_private_key));
+    if (ret != 0) {
+        seaf_warning ("Failed to set alg\n");
+        goto out;
+    }
+
+    jwt_token = jwt_encode_str (jwt);
+
+out:
+    jwt_free (jwt);
+    return jwt_token;
+}
+#endif
+
+char *
+seaf_parse_auth_token (const char *auth_token)
+{
+    char *token = NULL;
+    char **parts = NULL;
+
+    if (!auth_token) {
+        return NULL;
+    }
+
+    parts = g_strsplit (auth_token, " ", 2);
+    if (!parts) {
+        return NULL;
+    }
+
+    if (g_strv_length (parts) < 2) {
+        g_strfreev (parts);
+        return NULL;
+    }
+
+    token = g_strdup(parts[1]);
+
+    g_strfreev (parts);
+    return token;
+}
+
+void
+split_filename (const char *filename, char **name, char **ext)
+{
+    char *dot;
+
+    dot = strrchr (filename, '.');
+    if (dot) {
+        *ext = g_strdup (dot + 1);
+        *name = g_strndup (filename, dot - filename);
+    } else {
+        *name = g_strdup (filename);
+        *ext = NULL;
+    }
+}
+
+static gboolean
+collect_token_list (SeafDBRow *row, void *data)
+{
+    GList **p_tokens = data;
+    const char *token;
+
+    token = seaf_db_row_get_column_text (row, 0);
+    *p_tokens = g_list_prepend (*p_tokens, g_strdup(token));
+
+    return TRUE;
 }
 
 int
-load_seahub_database_config (SeafileSession *session)
+seaf_delete_repo_tokens (SeafRepo *repo)
 {
     int ret = 0;
-    json_t *object = NULL;
-    json_error_t err;
-    const char *engine = NULL, *name = NULL, *user = NULL, *password = NULL, *host = NULL, *charset = NULL;
-    int port;
-    char *json_str = NULL;
+    const char *template;
+    GList *token_list = NULL;
+    GList *ptr;
+    GString *token_list_str = g_string_new ("");
+    GString *sql = g_string_new ("");
+    int rc;
 
-    json_str = parse_seahub_db_config ();
-    if (!json_str){
-        seaf_warning ("Failed to parse seahub database config.\n");
-        ret = -1;
+    template = "SELECT u.token FROM RepoUserToken as u WHERE u.repo_id=?";
+    rc = seaf_db_statement_foreach_row (seaf->db, template,
+                                        collect_token_list, &token_list,
+                                        1, "string", repo->id);
+    if (rc < 0) {
         goto out;
     }
 
-    object = json_loadb (json_str, strlen(json_str), 0, &err);
-    if (!object) {
-        seaf_warning ("Failed to load seahub db json: %s: %s\n", json_str, err.text);
-        ret = -1;
+    if (rc == 0)
+        goto out;
+
+    for (ptr = token_list; ptr; ptr = ptr->next) {
+        const char *token = (char *)ptr->data;
+        seaf_message ("delete token: %s\n", token);
+        if (token_list_str->len == 0)
+            g_string_append_printf (token_list_str, "'%s'", token);
+        else
+            g_string_append_printf (token_list_str, ",'%s'", token);
+    }
+
+    /* Note that there is a size limit on sql query. In MySQL it's 1MB by default.
+     * Normally the token_list won't be that long.
+     */
+    g_string_printf (sql, "DELETE FROM RepoUserToken WHERE token in (%s)",
+                     token_list_str->str);
+    rc = seaf_db_statement_query (seaf->db, sql->str, 0);
+    if (rc < 0) {
         goto out;
     }
 
-    engine = json_object_get_string_member (object, "ENGINE");
-    name = json_object_get_string_member (object, "NAME");
-    user = json_object_get_string_member (object, "USER");
-    password = json_object_get_string_member (object, "PASSWORD");
-    host = json_object_get_string_member (object, "HOST");
-    charset = json_object_get_string_member (object, "CHARSET");
-    port = json_object_get_int_member (object, "PORT");
-    if (port <= 0) {
-        port = MYSQL_DEFAULT_PORT;
-    }
-
-    if (!engine || strstr (engine, "sqlite") != NULL) {
+    g_string_printf (sql, "DELETE FROM RepoTokenPeerInfo WHERE token in (%s)",
+                     token_list_str->str);
+    rc = seaf_db_statement_query (seaf->db, sql->str, 0);
+    if (rc < 0) {
         goto out;
-    }
-#ifdef HAVE_MYSQL
-    else if (strstr (engine, "mysql") != NULL) {
-        seaf_message("Use database Mysql\n");
-        if (!host) {
-            seaf_warning ("Seahub DB host not set in config.\n");
-            ret = -1;
-            goto out;
-        }
-        if (!user) {
-            seaf_warning ("Seahub DB user not set in config.\n");
-            ret = -1;
-            goto out;
-        }
-        if (!password) {
-            seaf_warning ("Seahub DB password not set in config.\n");
-            ret = -1;
-            goto out;
-        }
-        if (!name) {
-            seaf_warning ("Seahub DB name not set in config.\n");
-            ret = -1;
-            goto out;
-        }
-
-        session->seahub_db = seaf_db_new_mysql (host, port, user, password, name, NULL, FALSE, FALSE, NULL, charset, DEFAULT_MAX_CONNECTIONS);
-        if (!session->seahub_db) {
-            seaf_warning ("Failed to open seahub database.\n");
-            ret = -1;
-            goto out;
-        }
-    }
-#endif
-    else {
-        seaf_warning ("Unknown database type: %s.\n", engine);
-        ret = -1;
     }
 
 out:
-    if (object)
-        json_decref (object);
-    g_free (json_str);
+    g_string_free (token_list_str, TRUE);
+    g_string_free (sql, TRUE);
+    g_list_free_full (token_list, (GDestroyNotify)g_free);
+
+    if (rc < 0) {
+        ret = -1;
+    }
+
     return ret;
 }

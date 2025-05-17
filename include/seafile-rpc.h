@@ -150,6 +150,14 @@ seafile_change_repo_passwd (const char *repo_id,
                             const char *user,
                             GError **error);
 
+int
+seafile_upgrade_repo_pwd_hash_algorithm (const char *repo_id,
+                                         const char *user,
+                                         const char *passwd,
+                                         const char *pwd_hash_algo,
+                                         const char *pwd_hash_params,
+                                         GError **error);
+
 /**
  * seafile_repo_size:
  * 
@@ -626,6 +634,11 @@ seafile_get_repo_history_limit (const char *repo_id,
                                 GError **error);
 
 int
+seafile_set_repo_valid_since (const char *repo_id,
+                              gint64 timestamp,
+                              GError **error);
+
+int
 seafile_check_passwd (const char *repo_id,
                       const char *magic,
                       GError **error);
@@ -753,6 +766,12 @@ seafile_del_file (const char *repo_id,
                   const char *parent_dir, const char *file_name,
                   const char *user,
                   GError **error);
+
+int
+seafile_batch_del_files (const char *repo_id,
+                         const char *file_list,
+                         const char *user,
+                         GError **error);
 
 /**
  * copy a file/directory from a repo to another on server.

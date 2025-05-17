@@ -72,6 +72,10 @@ class SeafileAPI(object):
     def change_repo_passwd(self, repo_id, old_passwd, new_passwd, user):
         return seafserv_threaded_rpc.change_repo_passwd(repo_id, old_passwd,
                                                         new_passwd, user)
+
+    def upgrade_repo_pwd_hash_algorithm (self, repo_id, user, passwd, pwd_hash_algo, pwd_hash_params):
+        return seafserv_threaded_rpc.upgrade_repo_pwd_hash_algorithm (repo_id, user, passwd,
+                                                                      pwd_hash_algo, pwd_hash_params)
     def check_passwd(self, repo_id, magic):
         return seafserv_threaded_rpc.check_passwd(repo_id, magic)
 
@@ -300,6 +304,9 @@ class SeafileAPI(object):
     def del_file(self, repo_id, parent_dir, filename, username):
         return seafserv_threaded_rpc.del_file(repo_id, parent_dir, filename, username)
 
+    def batch_del_files(self, repo_id, filepaths, username):
+        return seafserv_threaded_rpc.batch_del_files(repo_id, filepaths, username)
+
     '''
     If you want to move or copy multiple files in a batch, @src_filename and @dst_filename
     should be json array, make sure the number of files
@@ -395,6 +402,9 @@ class SeafileAPI(object):
         Set repo history limit in days. Pass -1 if set to unlimited.
         """
         return seafserv_threaded_rpc.set_repo_history_limit(repo_id, days)
+
+    def set_repo_valid_since(self, repo_id, timestamp):
+        return seafserv_threaded_rpc.set_repo_valid_since(repo_id, timestamp)
 
     def check_repo_blocks_missing(self, repo_id, blklist):
         return seafserv_threaded_rpc.check_repo_blocks_missing(repo_id, blklist)
@@ -858,7 +868,7 @@ class SeafileAPI(object):
 
     def search_files_by_path (self, repo_id, path, search_str):
         return seafserv_threaded_rpc.search_files_by_path(repo_id, path, search_str)
-    
+
 seafile_api = SeafileAPI()
 
 class CcnetAPI(object):
@@ -990,7 +1000,7 @@ class CcnetAPI(object):
         """
         return ccnet_threaded_rpc.update_emailuser(source, user_id, password, is_staff, is_active)
 
-    def update_role_emailuser(self, email, role):
+    def update_role_emailuser(self, email, role, is_manual_set=True):
         return ccnet_threaded_rpc.update_role_emailuser(email, role)
 
     def get_superusers(self):

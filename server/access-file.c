@@ -27,10 +27,10 @@
 #include "access-file.h"
 #include "zip-download-mgr.h"
 #include "http-server.h"
+#include "seaf-utils.h"
 
 #define FILE_TYPE_MAP_DEFAULT_LEN 1
 #define BUFFER_SIZE 1024 * 64
-#define MULTI_DOWNLOAD_FILE_PREFIX "documents-export-"
 
 struct file_type_map {
     char *suffix;
@@ -132,6 +132,9 @@ static struct file_type_map ftmap[] = {
     { "mp3", "audio/mp3" },
     { "mpeg", "video/mpeg" },
     { "mp4", "video/mp4" },
+    { "ogv", "video/ogg" },
+    { "mov", "video/mp4" },
+    { "webm", "video/webm" },
     { "jpg", "image/jpeg" },
     { "JPG", "image/jpeg" },
     { "jpeg", "image/jpeg" },
@@ -142,6 +145,14 @@ static struct file_type_map ftmap[] = {
     { "GIF", "image/gif" },
     { "svg", "image/svg+xml" },
     { "SVG", "image/svg+xml" },
+    { "heic", "image/heic" },
+    { "ico", "image/x-icon" },
+    { "bmp", "image/bmp" },
+    { "tif", "image/tiff" },
+    { "tiff", "image/tiff" },
+    { "psd", "image/vnd.adobe.photoshop" },
+    { "webp", "image/webp" },
+    { "jfif", "image/jpeg" },
     { NULL, NULL },
 };
 
@@ -338,14 +349,12 @@ next:
 
             evhtp_send_reply_end (data->req);
 
-            if (g_strcmp0(data->token_type, "view") != 0) {
-                char *oper = "web-file-download";
-                if (g_strcmp0(data->token_type, "download-link") == 0)
-                    oper = "link-file-download";
+            char *oper = "web-file-download";
+            if (g_strcmp0(data->token_type, "download-link") == 0)
+                oper = "link-file-download";
 
-                send_statistic_msg(data->store_id, data->user, oper,
-                                   (guint64)data->file->file_size);
-            }
+            send_statistic_msg(data->store_id, data->user, oper,
+                               (guint64)data->file->file_size);
 
             free_sendfile_data (data);
             return;
@@ -511,11 +520,16 @@ parse_content_type(const char *filename)
         return NULL;
     p++;
 
+    char *lower = g_utf8_strdown (p, strlen(p));
+
     for (i = 0; ftmap[i].suffix != NULL; i++) {
-        if (strcmp(p, ftmap[i].suffix) == 0)
+        if (strcmp(lower, ftmap[i].suffix) == 0) {
+            g_free (lower);
             return ftmap[i].type;
+        }
     }
 
+    g_free (lower);
     return NULL;
 }
 
@@ -602,20 +616,17 @@ do_file(evhtp_request_t *req, SeafRepo *repo, const char *file_id,
     evhtp_headers_add_header (req->headers_out,
                               evhtp_header_new("Content-Length", file_size, 1, 1));
 
+    char *esc_filename = g_uri_escape_string(filename, NULL, FALSE);
     if (strcmp(operation, "download") == 0 ||
         strcmp(operation, "download-link") == 0) {
         /* Safari doesn't support 'utf8', 'utf-8' is compatible with most of browsers. */
         snprintf(cont_filename, SEAF_PATH_MAX,
-                 "attachment;filename*=\"utf-8\' \'%s\"", filename);
+                 "attachment;filename*=utf-8''%s;filename=\"%s\"", esc_filename, filename);
     } else {
-        if (test_firefox (req)) {
-            snprintf(cont_filename, SEAF_PATH_MAX,
-                     "inline;filename*=\"utf-8\' \'%s\"", filename);
-        } else {
-            snprintf(cont_filename, SEAF_PATH_MAX,
-                     "inline;filename=\"%s\"", filename);
-        }
+        snprintf(cont_filename, SEAF_PATH_MAX,
+                 "inline;filename*=utf-8''%s;filename=\"%s\"", esc_filename, filename);
     }
+    g_free (esc_filename);
     evhtp_headers_add_header(req->headers_out,
                              evhtp_header_new("Content-Disposition", cont_filename,
                                               1, 1));
@@ -897,27 +908,20 @@ set_resp_disposition (evhtp_request_t *req, const char *operation,
                       const char *filename)
 {
     char *cont_filename = NULL;
+    char *esc_filename = g_uri_escape_string(filename, NULL, FALSE);
 
     if (strcmp(operation, "download") == 0) {
-        if (test_firefox (req)) {
-            cont_filename = g_strdup_printf("attachment;filename*=\"utf-8\' \'%s\"",
-                                            filename);
-
-        } else {
-            cont_filename = g_strdup_printf("attachment;filename=\"%s\"", filename);
-        }
+        cont_filename = g_strdup_printf("attachment;filename*=utf-8''%s;filename=\"%s\"",
+                                        esc_filename, filename);
     } else {
-        if (test_firefox (req)) {
-            cont_filename = g_strdup_printf("inline;filename*=\"utf-8\' \'%s\"",
-                                            filename);
-        } else {
-            cont_filename = g_strdup_printf("inline;filename=\"%s\"", filename);
-        }
+        cont_filename = g_strdup_printf("inline;filename*=utf-8''%s;filename=\"%s\"",
+                                        esc_filename, filename);
     }
 
     evhtp_headers_add_header(req->headers_out,
                              evhtp_header_new("Content-Disposition", cont_filename,
                                               0, 1));
+    g_free (esc_filename);
     g_free (cont_filename);
 }
 
@@ -1062,8 +1066,14 @@ start_download_zip_file (evhtp_request_t *req, const char *token,
     evhtp_headers_add_header (req->headers_out,
             evhtp_header_new("Content-Length", file_size, 1, 1));
 
+    char *zippath = g_strdup_printf("%s.zip", zipname);
+    char *esc_zippath = g_uri_escape_string(zippath, NULL, FALSE);
+
     snprintf(cont_filename, SEAF_PATH_MAX,
-             "attachment;filename=\"%s.zip\"", zipname);
+             "attachment;filename*=utf-8''%s;filename=\"%s\"", esc_zippath, zippath);
+
+    g_free (zippath);
+    g_free (esc_zippath);
 
     evhtp_headers_add_header(req->headers_out,
             evhtp_header_new("Content-Disposition", cont_filename, 1, 1));
@@ -1117,6 +1127,19 @@ set_etag (evhtp_request_t *req,
     evhtp_kv_t *kv;
 
     kv = evhtp_kv_new ("ETag", file_id, 1, 1);
+    evhtp_kvs_add_kv (req->headers_out, kv);
+}
+
+static void
+set_no_cache (evhtp_request_t *req, gboolean private_cache)
+{
+    evhtp_kv_t *kv;
+
+    if (private_cache) {
+        kv = evhtp_kv_new ("Cache-Control", "private, no-cache", 1, 1);
+    } else {
+        kv = evhtp_kv_new ("Cache-Control", "public, no-cache", 1, 1);
+    }
     evhtp_kvs_add_kv (req->headers_out, kv);
 }
 
@@ -1189,6 +1212,7 @@ access_zip_cb (evhtp_request_t *req, void *arg)
     g_object_get (info, "obj_id", &info_str, NULL);
     if (!info_str) {
         seaf_warning ("Invalid obj_id for token: %s.\n", token);
+        error = "Internal server error\n";
         error_code = EVHTP_RES_SERVERR;
         goto out;
     }
@@ -1196,6 +1220,7 @@ access_zip_cb (evhtp_request_t *req, void *arg)
     info_obj = json_loadb (info_str, strlen(info_str), 0, &jerror);
     if (!info_obj) {
         seaf_warning ("Failed to parse obj_id field: %s for token: %s.\n", jerror.text, token);
+        error = "Internal server error\n";
         error_code = EVHTP_RES_SERVERR;
         goto out;
     }
@@ -1211,6 +1236,7 @@ access_zip_cb (evhtp_request_t *req, void *arg)
         filename = g_strconcat (MULTI_DOWNLOAD_FILE_PREFIX, date_str, NULL);
     } else {
         seaf_warning ("No dir_name or file_list in obj_id for token: %s.\n", token);
+        error = "Internal server error\n";
         error_code = EVHTP_RES_SERVERR;
         goto out;
     }
@@ -1220,6 +1246,7 @@ access_zip_cb (evhtp_request_t *req, void *arg)
         g_object_get (info, "repo_id", &repo_id, NULL);
         seaf_warning ("Failed to get zip file path for %s in repo %.8s, token:[%s].\n",
                       filename, repo_id, token);
+        error = "Internal server error\n";
         error_code = EVHTP_RES_SERVERR;
         goto out;
     }
@@ -1236,6 +1263,7 @@ access_zip_cb (evhtp_request_t *req, void *arg)
     int ret = start_download_zip_file (req, token, filename, zip_file_path, repo_id, user, token_type);
     if (ret < 0) {
         seaf_warning ("Failed to start download zip file: %s for token: %s", filename, token);
+        error = "Internal server error\n";
         error_code = EVHTP_RES_SERVERR;
     }
 
@@ -1262,6 +1290,88 @@ out:
     }
 }
 
+/*
+static void
+access_zip_link_cb (evhtp_request_t *req, void *arg)
+{
+    char *token;
+    char *user = NULL;
+    char *zip_file_path;
+    char *zip_file_name;
+    const char *repo_id = NULL;
+    const char *task_id = NULL;
+    const char *error = NULL;
+    int error_code;
+    SeafileShareLinkInfo *info = NULL;
+
+    char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
+    if (g_strv_length (parts) != 2) {
+        error = "Invalid URL\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    token = parts[1];
+
+    task_id = evhtp_kv_find (req->uri->query, "task_id");
+    if (!task_id) {
+        error = "No task_id\n";
+        error_code = EVHTP_RES_BADREQ;
+        goto out;
+    }
+
+    info = http_tx_manager_query_share_link_info (token, "dir");
+    if (!info) {
+        error = "Access token not found\n";
+        error_code = EVHTP_RES_FORBIDDEN;
+        goto out;
+    }
+
+    repo_id = seafile_share_link_info_get_repo_id (info);
+    user = seaf_repo_manager_get_repo_owner (seaf->repo_mgr, repo_id);
+
+    zip_file_path = zip_download_mgr_get_zip_file_path (seaf->zip_download_mgr, task_id);
+    if (!zip_file_path) {
+        seaf_warning ("Failed to get zip file path in repo %.8s, task id:[%s].\n", repo_id, task_id);
+        error = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+        goto out;
+    }
+    zip_file_name = zip_download_mgr_get_zip_file_name (seaf->zip_download_mgr, task_id);
+    if (!zip_file_name) {
+        seaf_warning ("Failed to get zip file name in repo %.8s, task id:[%s].\n", repo_id, task_id);
+        error = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+        goto out;
+    }
+
+    if (can_use_cached_content (req)) {
+        // Clean zip progress related resource
+        zip_download_mgr_del_zip_progress (seaf->zip_download_mgr, task_id);
+        goto out;
+    }
+
+    int ret = start_download_zip_file (req, task_id, zip_file_name, zip_file_path, repo_id, user, "download-multi-link");
+    if (ret < 0) {
+        seaf_warning ("Failed to start download zip file: %s for task: %s", zip_file_name, task_id);
+        error = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+    }
+
+out:
+    g_strfreev (parts);
+    if (info)
+        g_object_unref (info);
+    if (user)
+        g_free (user);
+
+    if (error) {
+        evbuffer_add_printf(req->buffer_out, "%s\n", error);
+        evhtp_send_reply(req, error_code);
+    }
+}
+*/
+
 static void
 access_cb(evhtp_request_t *req, void *arg)
 {
@@ -1269,6 +1379,7 @@ access_cb(evhtp_request_t *req, void *arg)
     char *error = NULL;
     char *token = NULL;
     char *filename = NULL;
+    char *dec_filename = NULL;
     const char *repo_id = NULL;
     const char *data = NULL;
     const char *operation = NULL;
@@ -1289,6 +1400,9 @@ access_cb(evhtp_request_t *req, void *arg)
 
     token = parts[1];
     filename = parts[2];
+
+    // The filename is url-encoded.
+    dec_filename = g_uri_unescape_string(filename, NULL);
 
     webaccess = seaf_web_at_manager_query_access_token (seaf->web_at_mgr, token);
     if (!webaccess) {
@@ -1340,18 +1454,19 @@ access_cb(evhtp_request_t *req, void *arg)
     }
 
     if (!repo->encrypted && byte_ranges) {
-        if (do_file_range (req, repo, data, filename, operation, byte_ranges, user) < 0) {
+        if (do_file_range (req, repo, data, dec_filename, operation, byte_ranges, user) < 0) {
             error = "Internal server error\n";
             error_code = EVHTP_RES_SERVERR;
             goto on_error;
         }
-    } else if (do_file(req, repo, data, filename, operation, key, user) < 0) {
+    } else if (do_file(req, repo, data, dec_filename, operation, key, user) < 0) {
         error = "Internal server error\n";
         error_code = EVHTP_RES_SERVERR;
         goto on_error;
     }
 
 success:
+    g_free (dec_filename);
     g_strfreev (parts);
     if (repo != NULL)
         seaf_repo_unref (repo);
@@ -1363,6 +1478,7 @@ success:
     return;
 
 on_error:
+    g_free (dec_filename);
     g_strfreev (parts);
     if (repo != NULL)
         seaf_repo_unref (repo);
@@ -1373,6 +1489,158 @@ on_error:
 
     evbuffer_add_printf(req->buffer_out, "%s\n", error);
     evhtp_send_reply(req, error_code);
+}
+
+static void
+access_v2_cb(evhtp_request_t *req, void *arg)
+{
+    SeafRepo *repo = NULL;
+    char *error_str = NULL;
+    char *err_msg = NULL;
+    char *token = NULL;
+    char *user = NULL;
+    char *dec_path = NULL;
+    char *rpath = NULL;
+    char *filename = NULL;
+    char *file_id = NULL;
+    char *ip_addr = NULL;
+    const char *repo_id = NULL;
+    const char *path = NULL;
+    const char *operation = NULL;
+    const char *byte_ranges = NULL;
+    const char *auth_token = NULL;
+    const char *cookie = NULL;
+    const char *user_agent = NULL;
+    int error_code = EVHTP_RES_BADREQ;
+
+    SeafileCryptKey *key = NULL;
+    GError *error = NULL;
+
+    /* Skip the first '/'. */
+    char **parts = g_strsplit (req->uri->path->full + 1, "/", 4);
+    if (!parts || g_strv_length (parts) < 4 ||
+        strcmp (parts[2], "files") != 0) {
+        error_str = "Invalid URL\n";
+        goto out;
+    }
+
+    repo_id = parts[1];
+
+    path = parts[3];
+    if (!path) {
+        error_str = "No file path\n";
+        goto out;
+    }
+    dec_path = g_uri_unescape_string(path, NULL);
+    rpath = format_dir_path (dec_path);
+    filename = g_path_get_basename (rpath);
+
+    operation = evhtp_kv_find (req->uri->query, "op");
+    if (!operation) {
+        error_str = "No operation\n";
+        goto out;
+    }
+    if (strcmp(operation, "view") != 0 &&
+        strcmp(operation, "download") != 0) {
+        error_str = "Operation is neither view or download\n";
+        goto out;
+    }
+
+
+    auth_token = evhtp_kv_find (req->headers_in, "Authorization");
+    token = seaf_parse_auth_token (auth_token);
+    cookie = evhtp_kv_find (req->headers_in, "Cookie");
+    ip_addr = get_client_ip_addr (req);
+    user_agent = evhtp_header_find (req->headers_in, "User-Agent");
+    if (!token && !cookie) {
+        error_str = "Both token and cookie are not set\n";
+        goto out;
+    }
+    int status = HTTP_OK;
+    if (http_tx_manager_check_file_access (repo_id, token, cookie, dec_path, "download", ip_addr, user_agent, &user, &status, &err_msg) < 0) {
+        if (status != HTTP_OK) {
+            error_str = err_msg;
+            error_code = status;
+        } else {
+            error_str = "Internal server error\n";
+            error_code = EVHTP_RES_SERVERR;
+        }
+        goto out;
+    }
+
+    repo = seaf_repo_manager_get_repo(seaf->repo_mgr, repo_id);
+    if (!repo) {
+        error_str = "Bad repo id\n";
+        goto out;
+    }
+
+    file_id = seaf_fs_manager_get_seafile_id_by_path (seaf->fs_mgr, repo->store_id, repo->version, repo->root_id, rpath, &error);
+    if (!file_id) {
+        error_str = "Invalid file_path\n";
+        if (error)
+            g_clear_error(&error);
+        goto out;
+    }
+
+    const char *etag = evhtp_kv_find (req->headers_in, "If-None-Match");
+    if (g_strcmp0 (etag, file_id) == 0) {
+        evhtp_send_reply (req, EVHTP_RES_NOTMOD);
+        error_code = EVHTP_RES_OK;
+        goto out;
+    }
+    set_etag (req, file_id);
+    set_no_cache (req, TRUE);
+
+    byte_ranges = evhtp_kv_find (req->headers_in, "Range");
+
+    if (repo->encrypted) {
+        key = seaf_passwd_manager_get_decrypt_key (seaf->passwd_mgr,
+                                                   repo_id, user);
+        if (!key) {
+            error_str = "Repo is encrypted. Please provide password to view it.";
+            goto out;
+        }
+    }
+
+    if (!seaf_fs_manager_object_exists (seaf->fs_mgr,
+                                        repo->store_id, repo->version, file_id)) {
+        error_str = "Invalid file id\n";
+        goto out;
+    }
+
+    if (!repo->encrypted && byte_ranges) {
+        if (do_file_range (req, repo, file_id, filename, operation, byte_ranges, user) < 0) {
+            error_str = "Internal server error\n";
+            error_code = EVHTP_RES_SERVERR;
+            goto out;
+        }
+    } else if (do_file(req, repo, file_id, filename, operation, key, user) < 0) {
+        error_str = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+        goto out;
+    }
+
+    error_code = EVHTP_RES_OK;
+
+out:
+    g_strfreev (parts);
+    g_free (token);
+    g_free (user);
+    g_free (dec_path);
+    g_free (rpath);
+    g_free (filename);
+    g_free (file_id);
+    g_free (ip_addr);
+    if (repo != NULL)
+        seaf_repo_unref (repo);
+    if (key != NULL)
+        g_object_unref (key);
+
+    if (error_code != EVHTP_RES_OK) {
+        evbuffer_add_printf(req->buffer_out, "%s\n", error_str);
+        evhtp_send_reply(req, error_code);
+    }
+    g_free (err_msg);
 }
 
 static int
@@ -1550,12 +1818,554 @@ on_error:
     evhtp_send_reply(req, error_code);
 }
 
+static void
+access_link_cb(evhtp_request_t *req, void *arg)
+{
+    SeafRepo *repo = NULL;
+    char *error_str = NULL;
+    char *token = NULL;
+    char *rpath = NULL;
+    char *filename = NULL;
+    char *file_id = NULL;
+    char *user = NULL;
+    char *norm_file_path = NULL;
+    const char *repo_id = NULL;
+    const char *file_path = NULL;
+    const char *share_type = NULL;
+    const char *byte_ranges = NULL;
+    const char *operation = NULL;
+    int error_code = EVHTP_RES_BADREQ;
+
+    SeafileCryptKey *key = NULL;
+    SeafileShareLinkInfo *info = NULL;
+    GError *error = NULL;
+
+    if (!seaf->seahub_pk) {
+        seaf_warning ("No seahub private key is configured.\n");
+        evhtp_send_reply(req, EVHTP_RES_NOTFOUND);
+        return;
+    }
+
+    /* Skip the first '/'. */
+    char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
+    if (!parts || g_strv_length (parts) < 2 ||
+        strcmp (parts[0], "f") != 0) {
+        error_str = "Invalid URL\n";
+        goto out;
+    }
+
+    token = parts[1];
+
+    operation = evhtp_kv_find (req->uri->query, "op");
+    if (g_strcmp0 (operation, "view") != 0) {
+        operation = "download-link";
+    }
+
+    char *ip_addr = get_client_ip_addr (req);
+    const char *user_agent = evhtp_header_find (req->headers_in, "User-Agent");
+
+    const char *cookie = evhtp_kv_find (req->headers_in, "Cookie");
+    int status = HTTP_OK;
+    char *err_msg = NULL;
+    info = http_tx_manager_query_share_link_info (token, cookie, "file", ip_addr, user_agent, &status, &err_msg);
+    if (!info) {
+        g_strfreev (parts);
+        if (status != HTTP_OK) {
+            evbuffer_add_printf(req->buffer_out, "%s\n", err_msg);
+            evhtp_send_reply(req, status);
+        } else {
+            error_str = "Internal server error\n";
+            error_code = EVHTP_RES_SERVERR;
+            evbuffer_add_printf(req->buffer_out, "%s\n", error_str);
+            evhtp_send_reply(req, error_code);
+        }
+        g_free (ip_addr);
+        g_free (err_msg);
+        return;
+    }
+    g_free (ip_addr);
+
+    repo_id = seafile_share_link_info_get_repo_id (info);
+    file_path = seafile_share_link_info_get_file_path (info);
+    if (!file_path) {
+        error_str = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+        seaf_warning ("Failed to get file_path by token %s\n", token);
+        goto out;
+    }
+    share_type = seafile_share_link_info_get_share_type (info);
+    if (g_strcmp0 (share_type, "f") != 0) {
+        error_str = "Link type mismatch";
+        goto out;
+    }
+
+    norm_file_path = normalize_utf8_path(file_path);
+    rpath = format_dir_path (norm_file_path);
+    filename = g_path_get_basename (rpath);
+
+    repo = seaf_repo_manager_get_repo(seaf->repo_mgr, repo_id);
+    if (!repo) {
+        error_str = "Bad repo id\n";
+        goto out;
+    }
+    user = seaf_repo_manager_get_repo_owner (seaf->repo_mgr, repo_id);
+
+    file_id = seaf_fs_manager_get_seafile_id_by_path (seaf->fs_mgr, repo->store_id, repo->version, repo->root_id, rpath, &error);
+    if (!file_id) {
+        error_str = "Invalid file_path\n";
+        if (error)
+            g_clear_error(&error);
+        goto out;
+    }
+
+    const char *etag = evhtp_kv_find (req->headers_in, "If-None-Match");
+    if (g_strcmp0 (etag, file_id) == 0) {
+        evhtp_send_reply (req, EVHTP_RES_NOTMOD);
+        error_code = EVHTP_RES_OK;
+        goto out;
+    }
+    set_etag (req, file_id);
+    set_no_cache (req, FALSE);
+
+    byte_ranges = evhtp_kv_find (req->headers_in, "Range");
+
+    if (repo->encrypted) {
+        key = seaf_passwd_manager_get_decrypt_key (seaf->passwd_mgr,
+                                                   repo_id, user);
+        if (!key) {
+            error_str = "Repo is encrypted. Please provide password to view it.";
+            goto out;
+        }
+    }
+
+    if (!seaf_fs_manager_object_exists (seaf->fs_mgr,
+                                        repo->store_id, repo->version, file_id)) {
+        error_str = "Invalid file id\n";
+        goto out;
+    }
+
+    if (!repo->encrypted && byte_ranges) {
+        if (do_file_range (req, repo, file_id, filename, operation, byte_ranges, user) < 0) {
+            error_str = "Internal server error\n";
+            error_code = EVHTP_RES_SERVERR;
+            goto out;
+        }
+    } else if (do_file(req, repo, file_id, filename, operation, key, user) < 0) {
+        error_str = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+        goto out;
+    }
+
+    error_code = EVHTP_RES_OK;
+
+out:
+    g_strfreev (parts);
+    g_free (user);
+    g_free (norm_file_path);
+    g_free (rpath);
+    g_free (filename);
+    g_free (file_id);
+    if (repo != NULL)
+        seaf_repo_unref (repo);
+    if (key != NULL)
+        g_object_unref (key);
+    if (info != NULL)
+        g_object_unref (info);
+
+    if (error_code != EVHTP_RES_OK) {
+        evbuffer_add_printf(req->buffer_out, "%s\n", error_str);
+        evhtp_send_reply(req, error_code);
+    }
+}
+
+/*
+static GList *
+json_to_dirent_list (SeafRepo *repo, const char *parent_dir, const char *dirents)
+{
+    json_t *array;
+    json_error_t jerror;
+    int i;
+    int len;
+    const char *tmp_file_name;
+    char *file_name = NULL;
+    GList *dirent_list = NULL, *p = NULL;
+    SeafDir *dir;
+    SeafDirent *dirent;
+    GError *error = NULL;
+
+    array = json_loadb (dirents, strlen(dirents), 0, &jerror);
+    if (!array) {
+        seaf_warning ("Failed to parse download data: %s.\n", jerror.text);
+        return NULL;
+    }
+    len = json_array_size (array);
+    if (len == 0) {
+        seaf_warning ("Invalid download data, miss download file name.\n");
+        json_decref (array);
+        return NULL;
+    }
+
+    dir = seaf_fs_manager_get_seafdir_by_path (seaf->fs_mgr, repo->store_id,
+                                               repo->version, repo->root_id, parent_dir, &error);
+    if (!dir) {
+        if (error) {
+            seaf_warning ("Failed to get dir %s repo %.8s: %s.\n",
+                          parent_dir, repo->store_id, error->message);
+            g_clear_error(&error);
+        } else {
+            seaf_warning ("dir %s doesn't exist in repo %.8s.\n",
+                          parent_dir, repo->store_id);
+        }
+        json_decref (array);
+        return NULL;
+    }
+
+    GHashTable *dirent_hash = g_hash_table_new(g_str_hash, g_str_equal);
+    for (p = dir->entries; p; p = p->next) {
+        SeafDirent *d = p->data;
+        g_hash_table_insert(dirent_hash, d->name, d);
+    }
+
+    for (i = 0; i < len; i++) {
+        tmp_file_name = json_string_value (json_array_get (array, i));
+        file_name = normalize_utf8_path(tmp_file_name);
+        if (strcmp (file_name, "") == 0 || strchr (file_name, '/') != NULL) {
+            seaf_warning ("Invalid download file name: %s.\n", file_name);
+            if (dirent_list) {
+                g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
+                dirent_list = NULL;
+            }
+            g_free (file_name);
+            break;
+        }
+
+        dirent = g_hash_table_lookup (dirent_hash, file_name);
+        if (!dirent) {
+            seaf_warning ("Failed to get dirent for %s in dir %s in repo %.8s.\n",
+                           file_name, parent_dir, repo->store_id);
+            if (dirent_list) {
+                g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
+                dirent_list = NULL;
+            }
+            g_free (file_name);
+            break;
+        }
+
+        dirent_list = g_list_prepend (dirent_list, seaf_dirent_dup(dirent));
+        g_free (file_name);
+    }
+
+    g_hash_table_unref(dirent_hash);
+    json_decref (array);
+    seaf_dir_free (dir);
+    return dirent_list;
+}
+
+// application/x-www-form-urlencoded
+// parent_dir=/sub&dirents=[a.md, suba]
+static char *
+get_form_field (const char *body_str, const char *field_name)
+{
+    char * value = NULL;
+    char * result = NULL;
+    char * start = strstr(body_str, field_name);
+    // find pos of start
+    if (start) {
+        // skip field and '='
+        start += strlen(field_name) + 1;
+
+        // find pos of '&'
+        char * end = strchr(start, '&');
+        if (end == NULL) {
+            end = start + strlen(start);
+        }
+
+        value = g_strndup(start, end - start);
+    }
+    if (!value) {
+        return NULL;
+    }
+    result = g_uri_unescape_string (value, NULL);
+    g_free (value);
+    return result;
+}
+*/
+
+/*
+static void
+access_dir_link_cb(evhtp_request_t *req, void *arg)
+{
+    SeafRepo *repo = NULL;
+    char *error_str = NULL;
+    char *token = NULL;
+    char *r_parent_dir = NULL;
+    char *fullpath = NULL;
+    char *file_id = NULL;
+    char *filename = NULL;
+    char *norm_parent_dir = NULL;
+    char *norm_path = NULL;
+    char *user = NULL;
+    char *tmp_parent_dir = NULL;
+    char *dirents = NULL;
+    const char *repo_id = NULL;
+    const char *parent_dir = NULL;
+    const char *path= NULL;
+    const char *byte_ranges = NULL;
+    int error_code = EVHTP_RES_BADREQ;
+
+    SeafileCryptKey *key = NULL;
+    SeafileShareLinkInfo *info = NULL;
+    GError *error = NULL;
+
+    if (!seaf->seahub_pk) {
+        seaf_warning ("No seahub private key is configured.\n");
+        evhtp_send_reply(req, EVHTP_RES_NOTFOUND);
+        return;
+    }
+
+    // Skip the first '/'.
+    char **parts = g_strsplit (req->uri->path->full + 1, "/", 0);
+    if (!parts || g_strv_length (parts) < 2 ||
+        strcmp (parts[0], "d") != 0) {
+        error_str = "Invalid URL\n";
+        goto on_error;
+    }
+
+    token = parts[1];
+
+    if (g_strv_length (parts) >= 4) {
+        if (strcmp (parts[2], "zip-task") != 0) {
+            error_str = "Invalid URL\n";
+            goto on_error;
+        }
+        char *task_id = parts[3];
+        char *progress = zip_download_mgr_query_zip_progress (seaf->zip_download_mgr, task_id, NULL);
+        if (!progress) {
+            error_str = "No zip progress\n";
+            goto on_error;
+        }
+        evbuffer_add_printf (req->buffer_out, "%s", progress);
+        evhtp_headers_add_header (
+            req->headers_out,
+            evhtp_header_new("Content-Type", "application/json; charset=utf-8", 1, 1));
+        evhtp_send_reply (req, EVHTP_RES_OK);
+        g_free (progress);
+        goto success;
+    }
+
+    info = http_tx_manager_query_share_link_info (token, "dir");
+    if (!info) {
+        error_str = "Link token not found\n";
+        error_code = EVHTP_RES_FORBIDDEN;
+        goto on_error;
+    }
+
+    repo_id = seafile_share_link_info_get_repo_id (info);
+
+    repo = seaf_repo_manager_get_repo(seaf->repo_mgr, repo_id);
+    if (!repo) {
+        error_str = "Bad repo id\n";
+        goto on_error;
+    }
+    user = seaf_repo_manager_get_repo_owner (seaf->repo_mgr, repo_id);
+
+    path = evhtp_kv_find (req->uri->query, "p");
+    if (!path) {
+        int len = evbuffer_get_length (req->buffer_in);
+        if (len <= 0) {
+            error_str = "Invalid request body\n";
+            goto on_error;
+        }
+        char *body = g_new0 (char, len);
+        evbuffer_remove(req->buffer_in, body, len);
+        tmp_parent_dir = get_form_field (body, "parent_dir");
+        if (!tmp_parent_dir) {
+            g_free (body);
+            error_str = "Invalid parent_dir\n";
+            goto on_error;
+        }
+
+        dirents = get_form_field (body, "dirents");
+        if (!dirents) {
+            g_free (body);
+            g_free (tmp_parent_dir);
+            error_str = "Invalid dirents\n";
+            goto on_error;
+        }
+        g_free (body);
+
+        norm_parent_dir = normalize_utf8_path (tmp_parent_dir);
+        r_parent_dir = format_dir_path (norm_parent_dir);
+        GList *dirent_list = json_to_dirent_list (repo, r_parent_dir, dirents);
+        if (!dirent_list) {
+            error_str = "Invalid dirents\n";
+            goto on_error;
+        }
+
+        char *task_id = NULL;
+        if (g_list_length(dirent_list) == 1) {
+            task_id = zip_download_mgr_start_zip_task_v2 (seaf->zip_download_mgr, repo_id, "download-dir-link", user, dirent_list);
+        } else {
+            task_id = zip_download_mgr_start_zip_task_v2 (seaf->zip_download_mgr, repo_id, "download-multi-link", user, dirent_list);
+        }
+        if (!task_id) {
+            g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
+            error_str = "Internal server error\n";
+            error_code = EVHTP_RES_SERVERR;
+            goto on_error;
+        }
+        evbuffer_add_printf (req->buffer_out, "{\"task_id\": \"%s\"}", task_id);
+        evhtp_headers_add_header (
+            req->headers_out,
+            evhtp_header_new("Content-Type", "application/json; charset=utf-8", 1, 1));
+        evhtp_send_reply (req, EVHTP_RES_OK);
+        g_free (task_id);
+        goto success;
+    }
+
+    if (can_use_cached_content (req)) {
+        goto success;
+    }
+
+    parent_dir = seafile_share_link_info_get_parent_dir (info);
+    norm_parent_dir = normalize_utf8_path (parent_dir);
+    norm_path = normalize_utf8_path (path);
+    r_parent_dir = format_dir_path (norm_parent_dir);
+    fullpath = g_build_filename(r_parent_dir, norm_path, NULL);
+    filename = g_path_get_basename (fullpath);
+
+    file_id = seaf_fs_manager_get_seafile_id_by_path (seaf->fs_mgr, repo->store_id, repo->version, repo->root_id, fullpath, &error);
+    if (!file_id) {
+        error_str = "Invalid file_path\n";
+        if (error)
+            g_clear_error(&error);
+        goto on_error;
+    }
+    set_etag (req, file_id);
+
+    byte_ranges = evhtp_kv_find (req->headers_in, "Range");
+
+    if (repo->encrypted) {
+        key = seaf_passwd_manager_get_decrypt_key (seaf->passwd_mgr,
+                                                   repo_id, user);
+        if (!key) {
+            error_str = "Repo is encrypted. Please provide password to view it.";
+            goto on_error;
+        }
+    }
+
+    if (!seaf_fs_manager_object_exists (seaf->fs_mgr,
+                                        repo->store_id, repo->version, file_id)) {
+        error_str = "Invalid file id\n";
+        goto on_error;
+    }
+
+    if (!repo->encrypted && byte_ranges) {
+        if (do_file_range (req, repo, file_id, filename, "download-link", byte_ranges, user) < 0) {
+            error_str = "Internal server error\n";
+            error_code = EVHTP_RES_SERVERR;
+            goto on_error;
+        }
+    } else if (do_file(req, repo, file_id, filename, "download-link", key, user) < 0) {
+        error_str = "Internal server error\n";
+        error_code = EVHTP_RES_SERVERR;
+        goto on_error;
+    }
+
+success:
+    g_strfreev (parts);
+    g_free (tmp_parent_dir);
+    g_free (dirents);
+    g_free (user);
+    g_free (norm_parent_dir);
+    g_free (norm_path);
+    g_free (r_parent_dir);
+    g_free (fullpath);
+    g_free (filename);
+    g_free (file_id);
+    if (repo != NULL)
+        seaf_repo_unref (repo);
+    if (key != NULL)
+        g_object_unref (key);
+    if (info)
+        g_object_unref (info);
+
+    return;
+
+on_error:
+    g_strfreev (parts);
+    g_free (tmp_parent_dir);
+    g_free (dirents);
+    g_free (user);
+    g_free (norm_parent_dir);
+    g_free (norm_path);
+    g_free (r_parent_dir);
+    g_free (fullpath);
+    g_free (filename);
+    g_free (file_id);
+    if (repo != NULL)
+        seaf_repo_unref (repo);
+    if (key != NULL)
+        g_object_unref (key);
+    if (info != NULL)
+        g_object_unref (info);
+
+    evbuffer_add_printf(req->buffer_out, "%s\n", error_str);
+    evhtp_send_reply(req, error_code);
+}
+*/
+
+static evhtp_res
+request_finish_cb (evhtp_request_t *req, void *arg)
+{
+    RequestInfo *info = arg;
+    struct timeval end, intv;
+
+    seaf_metric_manager_in_flight_request_dec (seaf->metric_mgr);
+
+    if (!info)
+        return EVHTP_RES_OK;
+
+    g_free (info->url_path);
+    g_free (info);
+    return EVHTP_RES_OK;
+}
+
+static evhtp_res
+access_headers_cb (evhtp_request_t *req, evhtp_headers_t *hdr, void *arg)
+{
+    RequestInfo *info = NULL;
+    info = g_new0 (RequestInfo, 1);
+    info->url_path = g_strdup (req->uri->path->full);
+
+    gettimeofday (&info->start, NULL);
+
+    seaf_metric_manager_in_flight_request_inc (seaf->metric_mgr);
+    evhtp_set_hook (&req->hooks, evhtp_hook_on_request_fini, request_finish_cb, info);
+    req->cbarg = info;
+
+    return EVHTP_RES_OK;
+}
+
 int
 access_file_init (evhtp_t *htp)
 {
-    evhtp_set_regex_cb (htp, "^/files/.*", access_cb, NULL);
-    evhtp_set_regex_cb (htp, "^/blks/.*", access_blks_cb, NULL);
-    evhtp_set_regex_cb (htp, "^/zip/.*", access_zip_cb, NULL);
+    evhtp_callback_t *cb;
+
+    cb = evhtp_set_regex_cb (htp, "^/files/.*", access_cb, NULL);
+    evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, access_headers_cb, NULL);
+
+    cb = evhtp_set_regex_cb (htp, "^/blks/.*", access_blks_cb, NULL);
+    evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, access_headers_cb, NULL);
+
+    cb = evhtp_set_regex_cb (htp, "^/zip/.*", access_zip_cb, NULL);
+    evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, access_headers_cb, NULL);
+
+    cb = evhtp_set_regex_cb (htp, "^/f/.*", access_link_cb, NULL);
+    evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, access_headers_cb, NULL);
+    //evhtp_set_regex_cb (htp, "^/d/.*", access_dir_link_cb, NULL);
+    cb = evhtp_set_regex_cb (htp, "^/repos/[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}/files/.*", access_v2_cb, NULL);
+    evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, access_headers_cb, NULL);
 
     return 0;
 }

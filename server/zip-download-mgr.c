@@ -16,7 +16,7 @@
 #define MAX_ZIP_THREAD_NUM 5
 #define SCAN_PROGRESS_INTERVAL 24 * 3600 // 1 day
 #define PROGRESS_TTL 5 * 3600 // 5 hours
-#define DEFAULT_MAX_DOWNLOAD_DIR_SIZE 100 * ((gint64)1 << 20) /* 100MB */
+#define DEFAULT_MAX_DOWNLOAD_DIR_SIZE 100 * 1000000 /* 100MB */
 
 typedef struct ZipDownloadMgrPriv {
     pthread_mutex_t progress_lock;
@@ -330,7 +330,7 @@ parse_download_multi_data (DownloadObj *obj, const char *data)
 
     for (i = 0; i < len; i++) {
         file_name = json_string_value (json_array_get (name_array, i));
-        if (strcmp (file_name, "") == 0 || strchr (file_name, '/') != NULL) {
+        if (strcmp (file_name, "") == 0) {
             seaf_warning ("Invalid download file name: %s.\n", file_name);
             if (dirent_list) {
                 g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
@@ -339,18 +339,42 @@ parse_download_multi_data (DownloadObj *obj, const char *data)
             break;
         }
 
-        dirent = g_hash_table_lookup (dirent_hash, file_name);
-        if (!dirent) {
-            seaf_warning ("Failed to get dirent for %s in dir %s in repo %.8s.\n",
-                           file_name, parent_dir, repo->store_id);
-            if (dirent_list) {
-                g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
-                dirent_list = NULL;
+        // Packing files in multi-level directories.
+        if (strchr (file_name, '/') != NULL) {
+            char *fullpath = g_build_path ("/", parent_dir, file_name, NULL);
+            dirent = seaf_fs_manager_get_dirent_by_path (seaf->fs_mgr, repo->store_id, repo->version, repo->root_id, fullpath, &error);
+            if (!dirent) {
+                if (error) {
+                    seaf_warning ("Failed to get path %s repo %.8s: %s.\n",
+                                  fullpath, repo->store_id, error->message);
+                    g_clear_error(&error);
+                } else {
+                    seaf_warning ("Path %s doesn't exist in repo %.8s.\n",
+                                  parent_dir, repo->store_id);
+                }
+                if (dirent_list) {
+                    g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
+                    dirent_list = NULL;
+                }
+                g_free (fullpath);
+                break;
             }
-            break;
-        }
+            g_free (fullpath);
+            dirent_list = g_list_prepend (dirent_list, dirent);
+        } else {
+            dirent = g_hash_table_lookup (dirent_hash, file_name);
+            if (!dirent) {
+                seaf_warning ("Failed to get dirent for %s in dir %s in repo %.8s.\n",
+                               file_name, parent_dir, repo->store_id);
+                if (dirent_list) {
+                    g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
+                    dirent_list = NULL;
+                }
+                break;
+            }
 
-        dirent_list = g_list_prepend (dirent_list, seaf_dirent_dup(dirent));
+            dirent_list = g_list_prepend (dirent_list, seaf_dirent_dup(dirent));
+        }
     }
 
     g_hash_table_unref(dirent_hash);
@@ -447,7 +471,7 @@ validate_download_size (DownloadObj *obj, GError **error)
     max_download_dir_size = seaf_cfg_manager_get_config_int64 (seaf->cfg_mgr, "fileserver",
                                                                "max_download_dir_size");
     if (max_download_dir_size > 0)
-        max_download_dir_size = max_download_dir_size * ((gint64)1 << 20);
+        max_download_dir_size = max_download_dir_size * 1000000;
     else
         max_download_dir_size = DEFAULT_MAX_DOWNLOAD_DIR_SIZE;
 
@@ -572,6 +596,90 @@ out:
     return ret;
 }
 
+/*
+#define TOKEN_LEN 36
+static char *
+gen_new_token (GHashTable *token_hash)
+{
+    char uuid[37];
+    char *token;
+
+    while (1) {
+        gen_uuid_inplace (uuid);
+        token = g_strndup(uuid, TOKEN_LEN);
+
+        // Make sure the new token doesn't conflict with an existing one.
+        if (g_hash_table_lookup (token_hash, token) != NULL)
+            g_free (token);
+        else
+            return token;
+    }
+}
+
+char *
+zip_download_mgr_start_zip_task_v2 (ZipDownloadMgr *mgr,
+                                    const char *repo_id,
+                                    const char *operation,
+                                    const char *user,
+                                    GList *dirent_list)
+{
+    SeafRepo *repo = NULL;
+    char *token = NULL;
+    char *task_id = NULL;
+    char *filename = NULL;
+    DownloadObj *obj;
+    Progress *progress;
+    ZipDownloadMgrPriv *priv = mgr->priv;
+
+    repo = seaf_repo_manager_get_repo(seaf->repo_mgr, repo_id);
+    if (!repo) {
+        seaf_warning ("Failed to get repo %s\n", repo_id);
+        return NULL;
+    }
+
+    obj = g_new0 (DownloadObj, 1);
+    obj->repo = repo;
+    obj->user = g_strdup (user);
+
+    if (strcmp (operation, "download-dir") == 0 ||
+        strcmp (operation, "download-dir-link") == 0) {
+        obj->type = DOWNLOAD_DIR;
+        SeafDirent *dent = dirent_list->data;
+        obj->dir_name = g_strdup (dent->name);
+        obj->internal = g_strdup (dent->id);
+        filename = g_strdup (obj->dir_name);
+        g_list_free_full (dirent_list, (GDestroyNotify)seaf_dirent_free);
+    } else {
+        obj->type = DOWNLOAD_MULTI;
+        obj->dir_name = g_strdup("");
+        obj->internal = dirent_list;
+        time_t now = time(NULL);
+        char date_str[11];
+        strftime(date_str, sizeof(date_str), "%Y-%m-%d", localtime(&now));
+        filename = g_strconcat (MULTI_DOWNLOAD_FILE_PREFIX, date_str, NULL);
+    }
+
+    progress = g_new0 (Progress, 1);
+    // Set to real total in worker thread. Here to just prevent the client from thinking
+    // the zip has been finished too early.
+    progress->total = 1;
+    progress->expire_ts = time(NULL) + PROGRESS_TTL;
+    progress->zip_file_name = filename;
+    obj->progress = progress;
+
+    pthread_mutex_lock (&priv->progress_lock);
+    token = gen_new_token (priv->progress_store);
+    g_hash_table_replace (priv->progress_store, token, progress);
+    pthread_mutex_unlock (&priv->progress_lock);
+    obj->token = g_strdup (token);
+    task_id = g_strdup (token);
+
+    g_thread_pool_push (priv->zip_tpool, obj, NULL);
+
+    return task_id;
+}
+*/
+
 static Progress *
 get_progress_obj (ZipDownloadMgrPriv *priv, const char *token)
 {
@@ -635,6 +743,21 @@ zip_download_mgr_get_zip_file_path (struct ZipDownloadMgr *mgr,
     }
     return progress->zip_file_path;
 }
+
+/*
+char *
+zip_download_mgr_get_zip_file_name (struct ZipDownloadMgr *mgr,
+                                    const char *token)
+{
+    Progress *progress;
+
+    progress = get_progress_obj (mgr->priv, token);
+    if (!progress) {
+        return NULL;
+    }
+    return progress->zip_file_name;
+}
+*/
 
 void
 zip_download_mgr_del_zip_progress (ZipDownloadMgr *mgr,

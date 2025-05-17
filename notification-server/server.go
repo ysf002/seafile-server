@@ -10,16 +10,16 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/dgrijalva/jwt-go"
 	_ "github.com/go-sql-driver/mysql"
+	jwt "github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/ini.v1"
 )
 
 var configDir string
@@ -31,48 +31,37 @@ var logFp *os.File
 
 var ccnetDB *sql.DB
 
+var logToStdout bool
+
 func init() {
 	flag.StringVar(&configDir, "c", "", "config directory")
 	flag.StringVar(&logFile, "l", "", "log file path")
+
+	env := os.Getenv("SEAFILE_LOG_TO_STDOUT")
+	if env == "true" {
+		logToStdout = true
+	}
 
 	log.SetFormatter(&LogFormatter{})
 }
 
 func loadNotifConfig() {
-	notifyConfPath := filepath.Join(configDir, "seafile.conf")
-
-	opts := ini.LoadOptions{}
-	opts.SpaceBeforeInlineComment = true
-	config, err := ini.LoadSources(opts, notifyConfPath)
-	if err != nil {
-		log.Fatalf("Failed to load notification.conf: %v", err)
+	host = os.Getenv("NOTIFICATION_SERVER_HOST")
+	if host == "" {
+		host = "0.0.0.0"
 	}
 
-	section, err := config.GetSection("notification")
-	if err != nil {
-		log.Fatal("No notification section in seafile.conf.")
-	}
-
-	host = "0.0.0.0"
 	port = 8083
-	logLevel := "info"
-	if key, err := section.GetKey("host"); err == nil {
-		host = key.String()
-	}
-
-	if key, err := section.GetKey("port"); err == nil {
-		n, err := key.Uint()
+	if os.Getenv("NOTIFICATION_SERVER_PORT") != "" {
+		i, err := strconv.Atoi(os.Getenv("NOTIFICATION_SERVER_PORT"))
 		if err == nil {
-			port = uint32(n)
+			port = uint32(i)
 		}
 	}
 
-	if key, err := section.GetKey("log_level"); err == nil {
-		logLevel = key.String()
-	}
-
-	if key, err := section.GetKey("jwt_private_key"); err == nil {
-		privateKey = key.String()
+	logLevel := os.Getenv("NOTIFICATION_SERVER_LOG_LEVEL")
+	if logLevel == "" {
+		logLevel = "info"
 	}
 
 	level, err := log.ParseLevel(logLevel)
@@ -85,66 +74,16 @@ func loadNotifConfig() {
 }
 
 func loadCcnetDB() {
-	ccnetConfPath := filepath.Join(configDir, "ccnet.conf")
-	config, err := ini.Load(ccnetConfPath)
+	option, err := loadDBOptionFromEnv()
 	if err != nil {
-		log.Fatalf("Failed to load ccnet.conf: %v", err)
+		log.Fatalf("Failed to load database from env: %v", err)
 	}
 
-	section, err := config.GetSection("Database")
-	if err != nil {
-		log.Fatal("No database section in ccnet.conf.")
-	}
-
-	var dbEngine string = "mysql"
-	key, err := section.GetKey("ENGINE")
-	if err == nil {
-		dbEngine = key.String()
-	}
-
-	if !strings.EqualFold(dbEngine, "mysql") {
-		log.Fatalf("Unsupported database %s.", dbEngine)
-	}
-
-	unixSocket := ""
-	if key, err = section.GetKey("UNIX_SOCKET"); err == nil {
-		unixSocket = key.String()
-	}
-
-	host := ""
-	if key, err = section.GetKey("HOST"); err == nil {
-		host = key.String()
-	} else if unixSocket == "" {
-		log.Fatal("No database host in ccnet.conf.")
-	}
-	// user is required.
-	if key, err = section.GetKey("USER"); err != nil {
-		log.Fatal("No database user in ccnet.conf.")
-	}
-	user := key.String()
-	password := ""
-	if key, err = section.GetKey("PASSWD"); err == nil {
-		password = key.String()
-	} else if unixSocket == "" {
-		log.Fatal("No database password in ccnet.conf.")
-	}
-	if key, err = section.GetKey("DB"); err != nil {
-		log.Fatal("No database db_name in ccnet.conf.")
-	}
-	dbName := key.String()
-	port := 3306
-	if key, err = section.GetKey("PORT"); err == nil {
-		port, _ = key.Int()
-	}
-	useTLS := false
-	if key, err = section.GetKey("USE_SSL"); err == nil {
-		useTLS, _ = key.Bool()
-	}
 	var dsn string
-	if unixSocket == "" {
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t", user, password, host, port, dbName, useTLS)
+	if option.UnixSocket == "" {
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t&readTimeout=60s&writeTimeout=60s", option.User, option.Password, option.Host, option.Port, option.CcnetDbName, option.UseTLS)
 	} else {
-		dsn = fmt.Sprintf("%s:%s@unix(%s)/%s", user, password, unixSocket, dbName)
+		dsn = fmt.Sprintf("%s:%s@unix(%s)/%s?readTimeout=60s&writeTimeout=60s", option.User, option.Password, option.UnixSocket, option.CcnetDbName)
 	}
 	ccnetDB, err = sql.Open("mysql", dsn)
 	if err != nil {
@@ -153,6 +92,59 @@ func loadCcnetDB() {
 	if err := ccnetDB.Ping(); err != nil {
 		log.Fatalf("Failed to connected to mysql: %v", err)
 	}
+	ccnetDB.SetConnMaxLifetime(5 * time.Minute)
+	ccnetDB.SetMaxOpenConns(8)
+	ccnetDB.SetMaxIdleConns(8)
+}
+
+type DBOption struct {
+	User          string
+	Password      string
+	Host          string
+	Port          int
+	CcnetDbName   string
+	SeafileDbName string
+	UnixSocket    string
+	UseTLS        bool
+}
+
+func loadDBOptionFromEnv() (*DBOption, error) {
+	user := os.Getenv("SEAFILE_MYSQL_DB_USER")
+	if user == "" {
+		return nil, fmt.Errorf("failed to read SEAFILE_MYSQL_DB_USER")
+	}
+	password := os.Getenv("SEAFILE_MYSQL_DB_PASSWORD")
+	if password == "" {
+		return nil, fmt.Errorf("failed to read SEAFILE_MYSQL_DB_PASSWORD")
+	}
+	host := os.Getenv("SEAFILE_MYSQL_DB_HOST")
+	if host == "" {
+		return nil, fmt.Errorf("failed to read SEAFILE_MYSQL_DB_HOST")
+	}
+	ccnetDbName := os.Getenv("SEAFILE_MYSQL_DB_CCNET_DB_NAME")
+	if ccnetDbName == "" {
+		ccnetDbName = "ccnet_db"
+		log.Infof("Failed to read SEAFILE_MYSQL_DB_CCNET_DB_NAME, use ccnet_db by default")
+	}
+	seafileDbName := os.Getenv("SEAFILE_MYSQL_DB_SEAFILE_DB_NAME")
+	if seafileDbName == "" {
+		seafileDbName = "seafile_db"
+		log.Infof("Failed to read SEAFILE_MYSQL_DB_SEAFILE_DB_NAME, use seafile_db by default")
+	}
+
+	log.Infof("Database: user = %s", user)
+	log.Infof("Database: host = %s", host)
+	log.Infof("Database: ccnet_db_name = %s", ccnetDbName)
+	log.Infof("Database: seafile_db_name = %s", seafileDbName)
+
+	option := new(DBOption)
+	option.User = user
+	option.Password = password
+	option.Host = host
+	option.Port = 3306
+	option.CcnetDbName = ccnetDbName
+	option.SeafileDbName = seafileDbName
+	return option, nil
 }
 
 func main() {
@@ -167,7 +159,9 @@ func main() {
 		log.Fatalf("config directory %s doesn't exist: %v.", configDir, err)
 	}
 
-	if logFile == "" {
+	if logToStdout {
+		// Use default output (StdOut)
+	} else if logFile == "" {
 		absLogFile = filepath.Join(configDir, "notification-server.log")
 		fp, err := os.OpenFile(absLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 		if err != nil {
@@ -188,14 +182,12 @@ func main() {
 		log.SetOutput(fp)
 	}
 
-	if absLogFile != "" {
-		errorLogFile := filepath.Join(filepath.Dir(absLogFile), "notification-server-error.log")
-		fp, err := os.OpenFile(errorLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-		if err != nil {
-			log.Fatalf("Failed to open or create error log file: %v", err)
-		}
-		syscall.Dup3(int(fp.Fd()), int(os.Stderr.Fd()), 0)
-		fp.Close()
+	if absLogFile != "" && !logToStdout {
+		Dup(int(logFp.Fd()), int(os.Stderr.Fd()))
+	}
+
+	if err := loadJwtPrivateKey(); err != nil {
+		log.Fatalf("Failed to read config: %v", err)
 	}
 
 	loadNotifConfig()
@@ -209,27 +201,39 @@ func main() {
 
 	log.Info("notification server started.")
 
-	addr := fmt.Sprintf("%s:%d", host, port)
-	err = http.ListenAndServe(addr, router)
+	server := new(http.Server)
+	server.Addr = fmt.Sprintf("%s:%d", host, port)
+	server.Handler = router
+
+	err = server.ListenAndServe()
 	if err != nil {
-		log.Info("notificationserver exiting: %v", err)
+		log.Infof("notificationserver exiting: %v", err)
 	}
+}
+
+func loadJwtPrivateKey() error {
+	privateKey = os.Getenv("JWT_PRIVATE_KEY")
+	if privateKey == "" {
+		return fmt.Errorf("failed to read JWT_PRIVATE_KEY")
+	}
+
+	return nil
 }
 
 func handleUser1Signal() {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGUSR1)
-	<-signalChan
 
 	for {
-		select {
-		case <-signalChan:
-			logRotate()
-		}
+		<-signalChan
+		logRotate()
 	}
 }
 
 func logRotate() {
+	if logToStdout {
+		return
+	}
 	fp, err := os.OpenFile(absLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
 		log.Fatalf("Failed to reopen notification log: %v", err)
@@ -240,13 +244,7 @@ func logRotate() {
 		logFp = fp
 	}
 
-	errorLogFile := filepath.Join(filepath.Dir(absLogFile), "notification-server-error.log")
-	errFp, err := os.OpenFile(errorLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("Failed to reopen notification error log: %v", err)
-	}
-	syscall.Dup3(int(errFp.Fd()), int(os.Stderr.Fd()), 0)
-	errFp.Close()
+	Dup(int(logFp.Fd()), int(os.Stderr.Fd()))
 }
 
 func newHTTPRouter() *mux.Router {
@@ -282,7 +280,7 @@ func messageCB(rsp http.ResponseWriter, r *http.Request) *appError {
 func eventCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	msg := Message{}
 
-	token := r.Header.Get("Seafile-Repo-Token")
+	token := getAuthorizationToken(r.Header)
 	if !checkAuthToken(token) {
 		return &appError{Error: nil,
 			Message: "Notification token not match",
@@ -308,6 +306,15 @@ func eventCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	Notify(&msg)
 
 	return nil
+}
+
+func getAuthorizationToken(h http.Header) string {
+	auth := h.Get("Authorization")
+	splitResult := strings.Split(auth, " ")
+	if len(splitResult) > 1 {
+		return splitResult[1]
+	}
+	return ""
 }
 
 func checkAuthToken(tokenString string) bool {

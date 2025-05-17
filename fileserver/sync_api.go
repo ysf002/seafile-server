@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -17,8 +17,6 @@ import (
 	"sync"
 	"time"
 
-	jwt "github.com/dgrijalva/jwt-go"
-	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"github.com/haiwen/seafile-server/fileserver/blockmgr"
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
@@ -83,7 +81,7 @@ type repoEventData struct {
 	clientName string
 }
 
-type statusEventData struct {
+type statsEventData struct {
 	eType  string
 	user   string
 	repoID string
@@ -471,7 +469,7 @@ func recvFSCB(rsp http.ResponseWriter, r *http.Request) *appError {
 		err := fmt.Errorf("Failed to get repo store id by repo id %s: %v", repoID, err)
 		return &appError{err, "", http.StatusInternalServerError}
 	}
-	fsBuf, err := ioutil.ReadAll(r.Body)
+	fsBuf, err := io.ReadAll(r.Body)
 	if err != nil {
 		return &appError{nil, err.Error(), http.StatusBadRequest}
 	}
@@ -655,7 +653,9 @@ func headCommitsMultiCB(rsp http.ResponseWriter, r *http.Request) *appError {
 			"repo_id IN (%s) LOCK IN SHARE MODE",
 		repoIDs.String())
 
-	rows, err := seafileDB.Query(sqlStr)
+	ctx, cancel := context.WithTimeout(context.Background(), option.DBOpTimeout)
+	defer cancel()
+	rows, err := seafileDB.QueryContext(ctx, sqlStr)
 	if err != nil {
 		err := fmt.Errorf("Failed to get commit id: %v", err)
 		return &appError{err, "", http.StatusInternalServerError}
@@ -725,16 +725,6 @@ func getCheckQuotaCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	return nil
 }
 
-type MyClaims struct {
-	Exp      int64
-	RepoID   string `json:"repo_id"`
-	UserName string `json:"username"`
-}
-
-func (*MyClaims) Valid() error {
-	return nil
-}
-
 func getJWTTokenCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	vars := mux.Vars(r)
 	repoID := vars["repoid"]
@@ -748,7 +738,8 @@ func getJWTTokenCB(rsp http.ResponseWriter, r *http.Request) *appError {
 		return appErr
 	}
 
-	tokenString, err := genJWTToken(repoID, user)
+	exp := time.Now().Add(time.Hour * 72).Unix()
+	tokenString, err := utils.GenNotifJWTToken(repoID, user, exp)
 	if err != nil {
 		return &appError{err, "", http.StatusInternalServerError}
 	}
@@ -758,28 +749,6 @@ func getJWTTokenCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	rsp.Write([]byte(data))
 
 	return nil
-}
-
-func genJWTToken(repoID, user string) (string, error) {
-	claims := MyClaims{
-		time.Now().Add(time.Hour * 72).Unix(),
-		repoID,
-		user,
-	}
-
-	token := jwt.NewWithClaims(jwt.GetSigningMethod("HS256"), &claims)
-	tokenString, err := token.SignedString([]byte(option.PrivateKey))
-	if err != nil {
-		err := fmt.Errorf("failed to gen jwt token for repo %s", repoID)
-		return "", err
-	}
-
-	return tokenString, nil
-}
-
-func isValidUUID(u string) bool {
-	_, err := uuid.Parse(u)
-	return err == nil
 }
 
 func getFsObjIDCB(rsp http.ResponseWriter, r *http.Request) *appError {
@@ -882,7 +851,7 @@ func getBlockInfo(rsp http.ResponseWriter, r *http.Request) *appError {
 	rsp.Header().Set("Content-Length", blockLen)
 	if err := blockmgr.Read(storeID, blockID, rsp); err != nil {
 		if !isNetworkErr(err) {
-			log.Printf("failed to read block %s: %v", blockID, err)
+			log.Errorf("failed to read block %s: %v", blockID, err)
 		}
 		return nil
 	}
@@ -911,7 +880,9 @@ func getRepoStoreID(repoID string) (string, error) {
 	var vInfo virtualRepoInfo
 	var rID, originRepoID sql.NullString
 	sqlStr := "SELECT repo_id, origin_repo FROM VirtualRepo where repo_id = ?"
-	row := seafileDB.QueryRow(sqlStr, repoID)
+	ctx, cancel := context.WithTimeout(context.Background(), option.DBOpTimeout)
+	defer cancel()
+	row := seafileDB.QueryRowContext(ctx, sqlStr, repoID)
 	if err := row.Scan(&rID, &originRepoID); err != nil {
 		if err == sql.ErrNoRows {
 			vInfo.storeID = repoID
@@ -933,18 +904,37 @@ func getRepoStoreID(repoID string) (string, error) {
 }
 
 func sendStatisticMsg(repoID, user, operation string, bytes uint64) {
-	rData := &statusEventData{operation, user, repoID, bytes}
+	rData := &statsEventData{operation, user, repoID, bytes}
 
-	publishStatusEvent(rData)
+	publishStatsEvent(rData)
 }
 
-func publishStatusEvent(rData *statusEventData) {
-	buf := fmt.Sprintf("%s\t%s\t%s\t%d",
-		rData.eType, rData.user,
-		rData.repoID, rData.bytes)
-	if _, err := rpcclient.Call("publish_event", seafileServerChannelStats, buf); err != nil {
-		log.Printf("Failed to publish event: %v", err)
+func publishStatsEvent(rData *statsEventData) {
+	data := make(map[string]interface{})
+	data["msg_type"] = rData.eType
+	data["user_name"] = rData.user
+	data["repo_id"] = rData.repoID
+	data["bytes"] = rData.bytes
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Warnf("Failed to publish event: %v", err)
+		return
 	}
+	if _, err := rpcclient.Call("publish_event", seafileServerChannelStats, string(jsonData)); err != nil {
+		log.Warnf("Failed to publish event: %v", err)
+	}
+}
+
+func saveLastGCID(repoID, token string) error {
+	repo := repomgr.Get(repoID)
+	if repo == nil {
+		return fmt.Errorf("failed to get repo: %s", repoID)
+	}
+	gcID, err := repomgr.GetCurrentGCID(repo.StoreID)
+	if err != nil {
+		return err
+	}
+	return repomgr.SetLastGCID(repoID, token, gcID)
 }
 
 func putCommitCB(rsp http.ResponseWriter, r *http.Request) *appError {
@@ -960,7 +950,7 @@ func putCommitCB(rsp http.ResponseWriter, r *http.Request) *appError {
 		return appErr
 	}
 
-	data, err := ioutil.ReadAll(r.Body)
+	data, err := io.ReadAll(r.Body)
 	if err != nil {
 		return &appError{nil, err.Error(), http.StatusBadRequest}
 	}
@@ -978,6 +968,15 @@ func putCommitCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	if err := commitmgr.Save(commit); err != nil {
 		err := fmt.Errorf("Failed to add commit %s: %v", commitID, err)
 		return &appError{err, "", http.StatusInternalServerError}
+	} else {
+		token := r.Header.Get("Seafile-Repo-Token")
+		if token == "" {
+			token = utils.GetAuthorizationToken(r.Header)
+		}
+		if err := saveLastGCID(repoID, token); err != nil {
+			err := fmt.Errorf("Failed to save gc id: %v", err)
+			return &appError{err, "", http.StatusInternalServerError}
+		}
 	}
 
 	return nil
@@ -996,7 +995,6 @@ func getCommitInfo(rsp http.ResponseWriter, r *http.Request) *appError {
 		return appErr
 	}
 	if exists, _ := commitmgr.Exists(repoID, commitID); !exists {
-		log.Printf("%s:%s is missing", repoID, commitID)
 		return &appError{nil, "", http.StatusNotFound}
 	}
 
@@ -1053,6 +1051,11 @@ func putUpdateBranchCB(rsp http.ResponseWriter, r *http.Request) *appError {
 		return &appError{err, "", http.StatusInternalServerError}
 	}
 
+	if includeInvalidPath(base, newCommit) {
+		msg := "Dir or file name is .."
+		return &appError{nil, msg, http.StatusBadRequest}
+	}
+
 	ret, err := checkQuota(repoID, 0)
 	if err != nil {
 		err := fmt.Errorf("Failed to check quota: %v", err)
@@ -1063,9 +1066,23 @@ func putUpdateBranchCB(rsp http.ResponseWriter, r *http.Request) *appError {
 		return &appError{nil, msg, seafHTTPResNoQuota}
 	}
 
-	if err := fastForwardOrMerge(user, repo, base, newCommit); err != nil {
-		err := fmt.Errorf("Fast forward merge for repo %s is failed: %v", repoID, err)
-		return &appError{err, "", http.StatusInternalServerError}
+	if option.VerifyClientBlocks {
+		if body, err := checkBlocks(r.Context(), repo, base, newCommit); err != nil {
+			return &appError{nil, body, seafHTTPResBlockMissing}
+		}
+	}
+
+	token := r.Header.Get("Seafile-Repo-Token")
+	if token == "" {
+		token = utils.GetAuthorizationToken(r.Header)
+	}
+	if err := fastForwardOrMerge(user, token, repo, base, newCommit); err != nil {
+		if errors.Is(err, ErrGCConflict) {
+			return &appError{nil, "GC Conflict.\n", http.StatusConflict}
+		} else {
+			err := fmt.Errorf("Fast forward merge for repo %s is failed: %v", repoID, err)
+			return &appError{err, "", http.StatusInternalServerError}
+		}
 	}
 
 	go mergeVirtualRepoPool.AddTask(repoID, "")
@@ -1076,15 +1093,114 @@ func putUpdateBranchCB(rsp http.ResponseWriter, r *http.Request) *appError {
 	return nil
 }
 
+type checkBlockAux struct {
+	storeID  string
+	version  int
+	fileList []string
+}
+
+func checkBlocks(ctx context.Context, repo *repomgr.Repo, base, remote *commitmgr.Commit) (string, error) {
+	aux := new(checkBlockAux)
+	aux.storeID = repo.StoreID
+	aux.version = repo.Version
+	opt := &diff.DiffOptions{
+		FileCB: checkFileBlocks,
+		DirCB:  checkDirCB,
+		Ctx:    ctx,
+		RepoID: repo.StoreID}
+	opt.Data = aux
+
+	trees := []string{base.RootID, remote.RootID}
+	if err := diff.DiffTrees(trees, opt); err != nil {
+		return "", err
+	}
+
+	if len(aux.fileList) == 0 {
+		return "", nil
+	}
+
+	body, _ := json.Marshal(aux.fileList)
+
+	return string(body), fmt.Errorf("block is missing")
+}
+
+func checkFileBlocks(ctx context.Context, baseDir string, files []*fsmgr.SeafDirent, data interface{}) error {
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	file1 := files[0]
+	file2 := files[1]
+
+	aux, ok := data.(*checkBlockAux)
+	if !ok {
+		err := fmt.Errorf("failed to assert results")
+		return err
+	}
+
+	if file2 == nil || file2.ID == emptySHA1 || (file1 != nil && file1.ID == file2.ID) {
+		return nil
+	}
+
+	file, err := fsmgr.GetSeafile(aux.storeID, file2.ID)
+	if err != nil {
+		return err
+	}
+	for _, blkID := range file.BlkIDs {
+		if !blockmgr.Exists(aux.storeID, blkID) {
+			aux.fileList = append(aux.fileList, file2.Name)
+			return nil
+		}
+	}
+
+	return nil
+}
+
+func checkDirCB(ctx context.Context, baseDir string, dirs []*fsmgr.SeafDirent, data interface{}, recurse *bool) error {
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	return nil
+}
+
+func includeInvalidPath(baseCommit, newCommit *commitmgr.Commit) bool {
+	var results []*diff.DiffEntry
+	if err := diff.DiffCommits(baseCommit, newCommit, &results, true); err != nil {
+		log.Infof("Failed to diff commits: %v", err)
+		return false
+	}
+
+	for _, entry := range results {
+		if entry.NewName != "" {
+			if shouldIgnore(entry.NewName) {
+				return true
+			}
+		} else {
+			if shouldIgnore(entry.Name) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 func getHeadCommit(rsp http.ResponseWriter, r *http.Request) *appError {
 	vars := mux.Vars(r)
 	repoID := vars["repoid"]
 	sqlStr := "SELECT EXISTS(SELECT 1 FROM Repo WHERE repo_id=?)"
 	var exists bool
-	row := seafileDB.QueryRow(sqlStr, repoID)
+	ctx, cancel := context.WithTimeout(context.Background(), option.DBOpTimeout)
+	defer cancel()
+	row := seafileDB.QueryRowContext(ctx, sqlStr, repoID)
 	if err := row.Scan(&exists); err != nil {
 		if err != sql.ErrNoRows {
-			log.Printf("DB error when check repo %s existence: %v", repoID, err)
+			log.Errorf("DB error when check repo %s existence: %v", repoID, err)
 			msg := `{"is_corrupted": 1}`
 			rsp.WriteHeader(http.StatusOK)
 			rsp.Write([]byte(msg))
@@ -1101,11 +1217,11 @@ func getHeadCommit(rsp http.ResponseWriter, r *http.Request) *appError {
 
 	var commitID string
 	sqlStr = "SELECT commit_id FROM Branch WHERE name='master' AND repo_id=?"
-	row = seafileDB.QueryRow(sqlStr, repoID)
+	row = seafileDB.QueryRowContext(ctx, sqlStr, repoID)
 
 	if err := row.Scan(&commitID); err != nil {
 		if err != sql.ErrNoRows {
-			log.Printf("DB error when get branch master: %v", err)
+			log.Errorf("DB error when get branch master: %v", err)
 			msg := `{"is_corrupted": 1}`
 			rsp.WriteHeader(http.StatusOK)
 			rsp.Write([]byte(msg))
@@ -1164,27 +1280,33 @@ func checkPermission(repoID, user, op string, skipCache bool) *appError {
 func validateToken(r *http.Request, repoID string, skipCache bool) (string, *appError) {
 	token := r.Header.Get("Seafile-Repo-Token")
 	if token == "" {
-		msg := "token is null"
-		return "", &appError{nil, msg, http.StatusBadRequest}
+		token = utils.GetAuthorizationToken(r.Header)
+		if token == "" {
+			msg := "token is null"
+			return "", &appError{nil, msg, http.StatusBadRequest}
+		}
 	}
 
-	if value, ok := tokenCache.Load(token); ok {
-		if info, ok := value.(*tokenInfo); ok {
-			if info.repoID != repoID {
-				msg := "Invalid token"
-				return "", &appError{nil, msg, http.StatusForbidden}
+	if !skipCache {
+		if value, ok := tokenCache.Load(token); ok {
+			if info, ok := value.(*tokenInfo); ok {
+				if info.repoID != repoID {
+					msg := "Invalid token"
+					return "", &appError{nil, msg, http.StatusForbidden}
+				}
+				return info.email, nil
 			}
-			return info.email, nil
 		}
 	}
 
 	email, err := repomgr.GetEmailByToken(repoID, token)
 	if err != nil {
-		log.Printf("Failed to get email by token %s: %v", token, err)
+		log.Errorf("Failed to get email by token %s: %v", token, err)
 		tokenCache.Delete(token)
 		return email, &appError{err, "", http.StatusInternalServerError}
 	}
 	if email == "" {
+		tokenCache.Delete(token)
 		msg := fmt.Sprintf("Failed to get email by token %s", token)
 		return email, &appError{nil, msg, http.StatusForbidden}
 	}
@@ -1245,7 +1367,7 @@ func onRepoOper(eType, repoID, user, ip, clientName string) {
 	vInfo, err := repomgr.GetVirtualRepoInfo(repoID)
 
 	if err != nil {
-		log.Printf("Failed to get virtual repo info by repo id %s: %v", repoID, err)
+		log.Errorf("Failed to get virtual repo info by repo id %s: %v", repoID, err)
 		return
 	}
 	if vInfo != nil {
@@ -1266,18 +1388,35 @@ func publishRepoEvent(rData *repoEventData) {
 	if rData.path == "" {
 		rData.path = "/"
 	}
-	buf := fmt.Sprintf("%s\t%s\t%s\t%s\t%s\t%s",
-		rData.eType, rData.user, rData.ip,
-		rData.clientName, rData.repoID, rData.path)
-	if _, err := rpcclient.Call("publish_event", seafileServerChannelEvent, buf); err != nil {
-		log.Printf("Failed to publish event: %v", err)
+	data := make(map[string]interface{})
+	data["msg_type"] = rData.eType
+	data["user_name"] = rData.user
+	data["ip"] = rData.ip
+	data["user_agent"] = rData.clientName
+	data["repo_id"] = rData.repoID
+	data["file_path"] = rData.path
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Warnf("Failed to publish event: %v", err)
+		return
+	}
+	if _, err := rpcclient.Call("publish_event", seafileServerChannelEvent, string(jsonData)); err != nil {
+		log.Warnf("Failed to publish event: %v", err)
 	}
 }
 
 func publishUpdateEvent(repoID string, commitID string) {
-	buf := fmt.Sprintf("repo-update\t%s\t%s", repoID, commitID)
-	if _, err := rpcclient.Call("publish_event", seafileServerChannelEvent, buf); err != nil {
-		log.Printf("Failed to publish event: %v", err)
+	data := make(map[string]interface{})
+	data["msg_type"] = "repo-update"
+	data["repo_id"] = repoID
+	data["commit_id"] = commitID
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		log.Warnf("Failed to publish event: %v", err)
+		return
+	}
+	if _, err := rpcclient.Call("publish_event", seafileServerChannelEvent, string(jsonData)); err != nil {
+		log.Warnf("Failed to publish event: %v", err)
 	}
 }
 

@@ -53,7 +53,7 @@ func mergeVirtualRepo(args ...interface{}) error {
 
 		err := mergeRepo(repoID)
 		if err != nil {
-			log.Printf("%v", err)
+			log.Errorf("%v", err)
 		}
 		runningRepoMutex.Lock()
 		delete(runningRepo, repoID)
@@ -85,7 +85,7 @@ func mergeVirtualRepo(args ...interface{}) error {
 
 		err := mergeRepo(id)
 		if err != nil {
-			log.Printf("%v", err)
+			log.Errorf("%v", err)
 		}
 		runningRepoMutex.Lock()
 		delete(runningRepo, id)
@@ -275,7 +275,7 @@ func handleMissingVirtualRepo(repo *repomgr.Repo, head *commitmgr.Commit, vInfo 
 						newName := filepath.Base(newPath)
 						err := editRepo(vInfo.RepoID, newName, "Changed library name", "")
 						if err != nil {
-							log.Printf("falied to rename repo %s.\n", newName)
+							log.Warnf("falied to rename repo %s.\n", newName)
 						}
 					}
 					isRenamed = true
@@ -362,7 +362,7 @@ func editRepoNeedRetry(repoID, name, desc, user string) (bool, error) {
 		return false, err
 	}
 
-	err = updateBranch(repoID, commit.CommitID, parent.CommitID, "")
+	_, err = updateBranch(repoID, repo.StoreID, commit.CommitID, parent.CommitID, "", false, "")
 	if err != nil {
 		return true, nil
 	}

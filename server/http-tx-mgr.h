@@ -45,4 +45,18 @@ http_post (Connection *conn, const char *url, const char *token,
 
 void
 http_tx_manager_init ();
+
+char *
+http_tx_manager_get_nickname (const char *modifier);
+
+SeafileShareLinkInfo *
+http_tx_manager_query_share_link_info (const char *token, const char *cookie, const char *type,
+                                       const char *ip_addr, const char *user_agent,
+                                       int *status, char **err_msg);
+
+int
+http_tx_manager_check_file_access (const char *repo_id, const char *token, const char *cookie,
+                                   const char *path, const char *op, const char *ip_addr,
+                                   const char *user_agent, char **user,
+                                   int *status, char **err_msg);
 #endif

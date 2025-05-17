@@ -29,6 +29,9 @@
 #include "zip-download-mgr.h"
 #include "index-blocks-mgr.h"
 #include "notif-mgr.h"
+#include "http-tx-mgr.h"
+#include "obj-cache.h"
+#include "metric-mgr.h"
 
 #include <searpc-client.h>
 
@@ -44,10 +47,11 @@ struct _SeafileSession {
     char                *tmp_file_dir;
     /* Config that's only loaded on start */
     GKeyFile            *config;
-    GKeyFile            *ccnet_config;
     SeafDB              *db;
     CcnetDB             *ccnet_db;
-    SeafDB              *seahub_db;
+    char                *seahub_pk;
+    char                *seahub_url;
+    ConnectionPool      *seahub_conn_pool;
 
     SeafBlockManager    *block_mgr;
     SeafFSManager       *fs_mgr;
@@ -90,7 +94,15 @@ struct _SeafileSession {
 
     // For notification server
     NotifManager *notif_mgr;
-    char         *private_key;
+    char         *notif_server_private_key;
+    char         *notif_url;
+
+    // For metric
+    SeafMetricManager *metric_mgr; 
+
+    ObjCache *obj_cache;
+
+    gboolean            log_to_stdout;
 
     gboolean is_repair;
 };

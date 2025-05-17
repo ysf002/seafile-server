@@ -12,7 +12,7 @@ from pysearpc import SearpcError
 
 _DEBUG = 'SEAFILE_DEBUG' in os.environ
 
-ENVIRONMENT_VARIABLES = ('CCNET_CONF_DIR', 'SEAFILE_CONF_DIR')
+ENVIRONMENT_VARIABLES = ('SEAFILE_CONF_DIR', )
 
 # Used to fix bug in some rpc calls, will be removed in near future.
 MAX_INT = 2147483647
@@ -27,7 +27,6 @@ def _load_path_from_env(key, check=True):
         print("Loading %s from %s" % (key, v))
     return os.path.normpath(os.path.expanduser(v))
 
-CCNET_CONF_PATH = _load_path_from_env('CCNET_CONF_DIR')
 SEAFILE_CONF_DIR = _load_path_from_env('SEAFILE_CONF_DIR')
 SEAFILE_CENTRAL_CONF_DIR = _load_path_from_env('SEAFILE_CENTRAL_CONF_DIR', check=False)
 SEAFILE_RPC_PIPE_PATH = _load_path_from_env ("SEAFILE_RPC_PIPE_PATH", check=False)
@@ -40,13 +39,6 @@ ccnet_threaded_rpc = seafserv_threaded_rpc
 # load ccnet server addr and port from ccnet.conf.
 # 'addr:port' is used when downloading a repo
 config = configparser.ConfigParser()
-config.read(os.path.join(SEAFILE_CENTRAL_CONF_DIR if SEAFILE_CENTRAL_CONF_DIR else CCNET_CONF_PATH,
-                         'ccnet.conf'))
-
-if config.has_option('LDAP', 'HOST'):
-    LDAP_HOST = config.get('LDAP', 'HOST')
-else:
-    LDAP_HOST = None
 
 config.read(os.path.join(SEAFILE_CENTRAL_CONF_DIR if SEAFILE_CENTRAL_CONF_DIR else SEAFILE_CONF_DIR,
                          'seafile.conf'))
@@ -69,15 +61,15 @@ MAX_UPLOAD_FILE_SIZE = None # Defaults to no limit
 try:
     max_upload_size_mb = int(get_fileserver_option('max_upload_size', 0))
     if max_upload_size_mb > 0:
-        MAX_UPLOAD_FILE_SIZE = max_upload_size_mb * (2 ** 20)
+        MAX_UPLOAD_FILE_SIZE = max_upload_size_mb * 1000000
 except ValueError:
     pass
 
-MAX_DOWNLOAD_DIR_SIZE = 100 * (2 ** 20) # Default max size of a downloadable dir
+MAX_DOWNLOAD_DIR_SIZE = 100 * 1000000 # Default max size of a downloadable dir
 try:
     max_download_dir_size_mb = int(get_fileserver_option('max_download_dir_size', 0))
     if max_download_dir_size_mb > 0:
-        MAX_DOWNLOAD_DIR_SIZE = max_download_dir_size_mb * (2 ** 20)
+        MAX_DOWNLOAD_DIR_SIZE = max_download_dir_size_mb * 1000000
 except ValueError:
     pass
 

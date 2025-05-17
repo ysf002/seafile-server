@@ -256,6 +256,20 @@ should_ignore_file(const char *filename, void *data)
 {
     /* GPatternSpec **spec = ignore_patterns; */
 
+    char **components = g_strsplit (filename, "/", -1);
+    int n_comps = g_strv_length (components);
+    int j = 0;
+    char *file_name;
+
+    for (; j < n_comps; ++j) {
+        file_name = components[j];
+        if (g_strcmp0(file_name, "..") == 0) {
+            g_strfreev (components);
+            return TRUE;
+        }
+    }
+    g_strfreev (components);
+
     if (!g_utf8_validate (filename, -1, NULL)) {
         seaf_warning ("File name %s contains non-UTF8 characters, skip.\n", filename);
         return TRUE;
@@ -611,7 +625,9 @@ del_repo:
     }
 
     seaf_db_statement_query (mgr->seaf->db,
-                             "DELETE FROM RepoUserToken WHERE repo_id = ?",
+                             "DELETE t.*, i.* FROM RepoUserToken t, "
+                             "RepoTokenPeerInfo i WHERE t.token=i.token AND "
+                             "t.repo_id=?",
                              1, "string", repo_id);
 
     seaf_db_statement_query (mgr->seaf->db,
@@ -1070,6 +1086,18 @@ create_tables_mysql (SeafRepoManager *mgr)
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
+    /* Tables for online GC */
+
+    sql = "CREATE TABLE IF NOT EXISTS GCID (id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, "
+          "repo_id CHAR(36), gc_id CHAR(36), UNIQUE INDEX(repo_id)) ENGINE=INNODB";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
+    sql = "CREATE TABLE IF NOT EXISTS LastGCID (id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, "
+          "repo_id CHAR(36), client_id VARCHAR(128), gc_id CHAR(36), UNIQUE INDEX(repo_id, client_id)) ENGINE=INNODB";
+    if (seaf_db_query (db, sql) < 0)
+        return -1;
+
     sql = "CREATE TABLE IF NOT EXISTS RepoTrash (id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, "
         "repo_id CHAR(36),"
         "repo_name VARCHAR(255), head_id CHAR(40), owner_id VARCHAR(255),"
@@ -1095,7 +1123,7 @@ create_tables_mysql (SeafRepoManager *mgr)
 
     sql = "CREATE TABLE IF NOT EXISTS WebUploadTempFiles ( "
         "id BIGINT NOT NULL PRIMARY KEY AUTO_INCREMENT, repo_id CHAR(40) NOT NULL, "
-        "file_path TEXT NOT NULL, tmp_file_path TEXT NOT NULL, UNIQUE INDEX(repo_id)) ENGINE=INNODB";
+        "file_path TEXT NOT NULL, tmp_file_path TEXT NOT NULL, INDEX(repo_id)) ENGINE=INNODB";
     if (seaf_db_query (db, sql) < 0)
         return -1;
 
@@ -3943,7 +3971,7 @@ seaf_repo_manager_create_new_repo (SeafRepoManager *mgr,
             goto bad;
         }
         if (algo != NULL) {
-            seafile_generate_pwd_hash (repo_id, passwd, salt, algo, params, pwd_hash);
+            seafile_generate_pwd_hash (enc_version, repo_id, passwd, salt, algo, params, pwd_hash);
         } else {
             seafile_generate_magic (enc_version, repo_id, passwd, salt, magic);
         }
@@ -4270,7 +4298,8 @@ retry:
     seaf_branch_set_commit (repo->head, commit->commit_id);
     if (seaf_branch_manager_test_and_update_branch (seaf->branch_mgr,
                                                     repo->head,
-                                                    parent->commit_id) < 0) {
+                                                    parent->commit_id,
+                                                    FALSE, NULL, NULL, NULL) < 0) {
         seaf_repo_unref (repo);
         seaf_commit_unref (commit);
         seaf_commit_unref (parent);
@@ -4363,6 +4392,97 @@ seaf_get_total_storage (GError **error)
     }
 
     return size;
+}
+
+/* Online GC related */
+
+char *
+seaf_repo_get_current_gc_id (SeafRepo *repo)
+{
+    if (seaf_db_type(seaf->db) == SEAF_DB_TYPE_SQLITE)
+        return NULL;
+
+    char *sql = "SELECT gc_id FROM GCID WHERE repo_id = ?";
+    char *gc_id;
+
+    if (!repo->virtual_info)
+        gc_id = seaf_db_statement_get_string (seaf->db, sql, 1, "string", repo->id);
+    else {
+        gc_id = seaf_db_statement_get_string (seaf->db, sql, 1, "string", repo->store_id);
+    }
+
+    return gc_id;
+}
+
+char *
+seaf_repo_get_last_gc_id (SeafRepo *repo, const char *client_id)
+{
+    if (seaf_db_type(seaf->db) == SEAF_DB_TYPE_SQLITE)
+        return NULL;
+
+    char *sql = "SELECT gc_id FROM LastGCID WHERE repo_id = ? AND client_id = ?";
+    char *gc_id;
+
+    gc_id = seaf_db_statement_get_string (seaf->db, sql,
+                                          2, "string", repo->id,
+                                          "string", client_id);
+
+    return gc_id;
+}
+
+gboolean
+seaf_repo_has_last_gc_id (SeafRepo *repo, const char *client_id)
+{
+    if (seaf_db_type(seaf->db) == SEAF_DB_TYPE_SQLITE)
+        return FALSE;
+
+    char *sql = "SELECT 1 FROM LastGCID WHERE repo_id = ? AND client_id = ?";
+    gboolean db_err;
+
+    return seaf_db_statement_exists (seaf->db, sql, &db_err,
+                                     2, "string", repo->id, "string", client_id);
+}
+
+int
+seaf_repo_set_last_gc_id (SeafRepo *repo,
+                          const char *client_id,
+                          const char *gc_id)
+{
+    if (seaf_db_type(seaf->db) == SEAF_DB_TYPE_SQLITE)
+        return 0;
+
+    gboolean id_exists, db_err = FALSE;
+    char *sql;
+    int ret = 0;
+
+    sql = "SELECT 1 FROM LastGCID WHERE repo_id = ? AND client_id = ?";
+    id_exists = seaf_db_statement_exists (seaf->db, sql, &db_err,
+                                          2, "string", repo->id, "string", client_id);
+    if (id_exists) {
+        sql = "UPDATE LastGCID SET gc_id = ? WHERE repo_id = ? AND client_id = ?";
+        ret = seaf_db_statement_query (seaf->db, sql,
+                                       3, "string", gc_id,
+                                       "string", repo->id, "string", client_id);
+    } else {
+        sql = "INSERT INTO LastGCID (repo_id, client_id, gc_id) VALUES (?, ?, ?)";
+        ret = seaf_db_statement_query (seaf->db, sql,
+                                       3, "string", repo->id,
+                                       "string", client_id, "string", gc_id);
+    }
+
+    return ret;
+}
+
+int
+seaf_repo_remove_last_gc_id (SeafRepo *repo,
+                             const char *client_id)
+{
+    if (seaf_db_type(seaf->db) == SEAF_DB_TYPE_SQLITE)
+        return 0;
+
+    char *sql = "DELETE FROM LastGCID WHERE repo_id = ? AND client_id = ?";
+    seaf_db_statement_query (seaf->db, sql, 2, "string", repo->id, "string", client_id);
+    return 0;
 }
 
 int

@@ -54,13 +54,17 @@ def make_build_env():
 
     _env_add('PATH', join(PREFIX, 'bin'))
     if on_github_actions():
-        _env_add('PYTHONPATH', join(os.environ.get('RUNNER_TOOL_CACHE'), 'Python/3.8.14/x64/lib/python3.8/site-packages'))
-    _env_add('PYTHONPATH', join(PREFIX, 'lib/python3.8/site-packages'))
+        _env_add('PYTHONPATH', join(os.environ.get('RUNNER_TOOL_CACHE'), 'Python/3.12.10/x64/lib/python3.12/site-packages'))
+    _env_add('PYTHONPATH', join(PREFIX, 'lib/python3.12/site-packages'))
     _env_add('PKG_CONFIG_PATH', join(PREFIX, 'lib', 'pkgconfig'))
     _env_add('PKG_CONFIG_PATH', join(PREFIX, 'lib64', 'pkgconfig'))
     _env_add('PKG_CONFIG_PATH', libsearpc_dir)
     _env_add('PKG_CONFIG_PATH', ccnet_dir)
     _env_add('LD_LIBRARY_PATH', join(PREFIX, 'lib'))
+
+    _env_add('JWT_PRIVATE_KEY', '@%ukmcl$k=9u-grs4azdljk(sn0kd!=mzc17xd7x8#!u$1x@kl')
+
+    _env_add('SEAFILE_MYSQL_DB_CCNET_DB_NAME', 'ccnet')
 
     # Prepend the seafile-server/python to PYTHONPATH so we don't need to "make
     # install" each time after editing python files.
@@ -169,7 +173,7 @@ class Libevhtp(Project):
     @chdir
     def compile_and_install(self):
         cmds = [
-            'cmake -DEVHTP_DISABLE_SSL=ON -DEVHTP_BUILD_SHARED=OFF',
+            'cmake -DEVHTP_DISABLE_SSL=ON -DEVHTP_BUILD_SHARED=OFF -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .',
             'make',
             'sudo make install',
             'sudo ldconfig',
@@ -201,20 +205,44 @@ class Libjwt(Project):
         for cmd in cmds:
             shell(cmd)
 
+class Libhiredis(Project):
+    def __init__(self):
+        super(Libhiredis, self).__init__('hiredis')
+
+    def branch(self):
+        return 'v1.1.0'
+
+    @property
+    def url(self):
+        return 'https://github.com/redis/hiredis.git'
+
+    @chdir
+    def compile_and_install(self):
+        cmds = [
+            'sudo make',
+            'sudo make install',
+        ]
+
+        for cmd in cmds:
+            shell(cmd)
+
 def fetch_and_build():
     libsearpc = Libsearpc()
     libjwt = Libjwt()
+    libhiredis = Libhiredis()
     libevhtp = Libevhtp()
     ccnet = CcnetServer()
     seafile = SeafileServer()
 
     libsearpc.clone()
     libjwt.clone()
+    libhiredis.clone()
     libevhtp.clone()
     ccnet.clone()
 
     libsearpc.compile_and_install()
     libjwt.compile_and_install()
+    libhiredis.compile_and_install()
     libevhtp.compile_and_install()
     seafile.compile_and_install()
 
@@ -233,10 +261,7 @@ def main():
     args = parse_args()
     if on_github_actions() and not args.test_only:
         fetch_and_build()
-    if on_github_actions():
-        dbs = ('sqlite3', 'mysql')
-    else:
-        dbs = ('sqlite3',)
+    dbs = ('mysql',)
     for db in dbs:
         start_and_test_with_db(db)
 

@@ -329,6 +329,7 @@ seaf_repo_manager_post_multi_files (SeafRepoManager *mgr,
                                     const char *paths_json,
                                     const char *user,
                                     int replace_existed,
+                                    gint64 mtime,
                                     char **new_ids,
                                     char **task_id,
                                     GError **error);
@@ -363,6 +364,7 @@ seaf_repo_manager_commit_file_blocks (SeafRepoManager *mgr,
                                       const char *user,
                                       gint64 file_size,
                                       int replace_existed,
+                                      gint64 mtime,
                                       char **new_id,
                                       GError **error);
 
@@ -405,6 +407,7 @@ seaf_repo_manager_put_file (SeafRepoManager *mgr,
                             const char *file_name,
                             const char *user,
                             const char *head_id,
+                            gint64 mtime,
                             char **new_file_id,                            
                             GError **error);
 
@@ -428,6 +431,13 @@ seaf_repo_manager_del_file (SeafRepoManager *mgr,
                             const char *file_name,
                             const char *user,
                             GError **error);
+
+int
+seaf_repo_manager_batch_del_files (SeafRepoManager *mgr,
+                                   const char *repo_id,
+                                   const char *file_list,
+                                   const char *user,
+                                   GError **error);
 
 SeafileCopyResult *
 seaf_repo_manager_copy_file (SeafRepoManager *mgr,
@@ -849,6 +859,26 @@ seaf_get_total_file_number (GError **error);
 gint64
 seaf_get_total_storage (GError **error);
 
+/* Online GC related */
+
+char *
+seaf_repo_get_current_gc_id (SeafRepo *repo);
+
+char *
+seaf_repo_get_last_gc_id (SeafRepo *repo, const char *client_id);
+
+gboolean
+seaf_repo_has_last_gc_id (SeafRepo *repo, const char *client_id);
+
+int
+seaf_repo_set_last_gc_id (SeafRepo *repo,
+                          const char *client_id,
+                          const char *gc_id);
+
+int
+seaf_repo_remove_last_gc_id (SeafRepo *repo,
+                             const char *client_id);
+
 int
 seaf_repo_manager_add_upload_tmp_file (SeafRepoManager *mgr,
                                        const char *repo_id,
@@ -916,6 +946,8 @@ post_files_and_gen_commit (GList *filenames,
                           const char *canon_path,
                           GList *id_list,
                           GList *size_list,
+                          gint64 mtime,
+                          char *last_gc_id,
                           GError **error);
 
 char *

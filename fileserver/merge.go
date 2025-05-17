@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -9,6 +12,8 @@ import (
 
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
 	"github.com/haiwen/seafile-server/fileserver/fsmgr"
+	"github.com/haiwen/seafile-server/fileserver/option"
+	"github.com/haiwen/seafile-server/fileserver/utils"
 )
 
 type mergeOptions struct {
@@ -228,8 +233,9 @@ func mergeEntries(storeID string, dents []*fsmgr.SeafDirent, baseDir string, opt
 			mergedDents = append(mergedDents, head)
 			opt.conflict = true
 		}
-	} else if base != nil && head == nil && remote == nil {
-	}
+	} /* else if base != nil && head == nil && remote == nil {
+	    Don't need to add anything to mergeDents.
+	}*/
 
 	return mergedDents, nil
 }
@@ -259,7 +265,6 @@ func mergeDirectories(storeID string, dents []*fsmgr.SeafDirent, baseDir string,
 		if dents[0].ID == dents[1].ID {
 			return mergedDents, nil
 		}
-		break
 	case 4:
 		mergedDents = append(mergedDents, dents[2])
 		return mergedDents, nil
@@ -267,9 +272,7 @@ func mergeDirectories(storeID string, dents []*fsmgr.SeafDirent, baseDir string,
 		if dents[0].ID == dents[2].ID {
 			return mergedDents, nil
 		}
-		break
-	case 6:
-	case 7:
+	case 6, 7:
 		if dents[1].ID == dents[2].ID {
 			mergedDents = append(mergedDents, dents[1])
 			return mergedDents, nil
@@ -280,7 +283,6 @@ func mergeDirectories(storeID string, dents []*fsmgr.SeafDirent, baseDir string,
 			mergedDents = append(mergedDents, dents[1])
 			return mergedDents, nil
 		}
-		break
 	default:
 		err := fmt.Errorf("wrong dir mask for merge")
 		return nil, err
@@ -379,10 +381,8 @@ func getNickNameByModifier(emailToNickname map[string]string, modifier string) s
 	if ok {
 		return nickname
 	}
-	if seahubDB != nil {
-		sqlStr := "SELECT nickname from profile_profile WHERE user = ?"
-		row := seahubDB.QueryRow(sqlStr, modifier)
-		row.Scan(&nickname)
+	if option.JWTPrivateKey != "" {
+		nickname = postGetNickName(modifier)
 	}
 
 	if nickname == "" {
@@ -390,6 +390,57 @@ func getNickNameByModifier(emailToNickname map[string]string, modifier string) s
 	}
 
 	emailToNickname[modifier] = nickname
+
+	return nickname
+}
+
+func postGetNickName(modifier string) string {
+	tokenString, err := utils.GenSeahubJWTToken()
+	if err != nil {
+		return ""
+	}
+
+	header := map[string][]string{
+		"Authorization": {"Token " + tokenString},
+	}
+
+	data, err := json.Marshal(map[string]interface{}{
+		"user_id_list": []string{modifier},
+	})
+	if err != nil {
+		return ""
+	}
+
+	url := option.SeahubURL + "/user-list/"
+	status, body, err := utils.HttpCommon("POST", url, header, bytes.NewReader(data))
+	if err != nil {
+		return ""
+	}
+	if status != http.StatusOK {
+		return ""
+	}
+
+	results := make(map[string]interface{})
+	err = json.Unmarshal(body, &results)
+	if err != nil {
+		return ""
+	}
+
+	userList, ok := results["user_list"].([]interface{})
+	if !ok {
+		return ""
+	}
+	nickname := ""
+	for _, element := range userList {
+		list, ok := element.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		nickname, _ = list["name"].(string)
+		if nickname != "" {
+			break
+		}
+	}
 
 	return nickname
 }

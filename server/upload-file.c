@@ -241,7 +241,7 @@ check_tmp_file_list (GList *tmp_files, int *error_code)
     max_upload_size = seaf_cfg_manager_get_config_int64 (seaf->cfg_mgr, "fileserver",
                                                          "max_upload_size");
     if (max_upload_size > 0)
-        max_upload_size = max_upload_size * ((gint64)1 << 20);
+        max_upload_size = max_upload_size * 1000000;
     else
         max_upload_size = -1;
     
@@ -422,12 +422,30 @@ file_id_list_from_json (const char *ret_json)
     return g_string_free (id_list, FALSE);
 }
 
+static gint64
+rfc3339_to_timestamp (const char *last_modify)
+{
+    if (!last_modify) {
+        return -1;
+    }
+    GDateTime *date_time = g_date_time_new_from_iso8601(last_modify, NULL);
+    if (!date_time) {
+        return -1;
+    }
+    gint64 mtime = g_date_time_to_unix(date_time);
+
+    g_date_time_unref(date_time);
+    return mtime;
+}
+
 static void
 upload_api_cb(evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     char *parent_dir, *replace_str;
     char *relative_path = NULL, *new_parent_dir = NULL;
+    char *last_modify = NULL;
+    gint64 mtime = 0;
     GError *error = NULL;
     int error_code = -1;
     char *filenames_json, *tmp_files_json;
@@ -466,6 +484,11 @@ upload_api_cb(evhtp_request_t *req, void *arg)
         seaf_debug ("[upload] No file uploaded.\n");
         send_error_reply (req, EVHTP_RES_BADREQ, "No file uploaded.\n");
         return;
+    }
+
+    last_modify = g_hash_table_lookup (fsm->form_kvs, "last_modify");
+    if (last_modify) {
+        mtime = rfc3339_to_timestamp (last_modify);
     }
 
     replace_str = g_hash_table_lookup (fsm->form_kvs, "replace");
@@ -575,6 +598,7 @@ upload_api_cb(evhtp_request_t *req, void *arg)
                                              tmp_files_json,
                                              fsm->user,
                                              replace,
+                                             mtime,
                                              &ret_json,
                                              fsm->need_idx_progress ? &task_id : NULL,
                                              &error);
@@ -588,6 +612,9 @@ upload_api_cb(evhtp_request_t *req, void *arg)
             } else if (error->code == SEAF_ERR_FILES_WITH_SAME_NAME) {
                 error_code = -1;
                 send_error_reply (req, EVHTP_RES_BADREQ, "Too many files with same name.\n");
+            } else if (error->code == SEAF_ERR_GC_CONFLICT) {
+                error_code = -1;
+                send_error_reply (req, EVHTP_RES_CONFLICT, "GC Conflict.\n");
             }
             g_clear_error (&error);
         }
@@ -681,6 +708,8 @@ upload_blks_api_cb(evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     const char *parent_dir, *file_name, *size_str, *replace_str, *commitonly_str;
+    char *last_modify = NULL;
+    gint64 mtime = 0;
     GError *error = NULL;
     int error_code = -1;
     char *blockids_json;
@@ -709,6 +738,11 @@ upload_blks_api_cb(evhtp_request_t *req, void *arg)
     if (size_str)
         file_size = atoll(size_str);
     commitonly_str = evhtp_kv_find (req->uri->query, "commitonly");
+
+    last_modify = g_hash_table_lookup (fsm->form_kvs, "last_modify");
+    if (last_modify) {
+        mtime = rfc3339_to_timestamp (last_modify);
+    }
 
     if (!file_name || !parent_dir || !size_str || file_size < 0) {
         seaf_debug ("[upload-blks] No parent dir or file name given.\n");
@@ -768,6 +802,7 @@ upload_blks_api_cb(evhtp_request_t *req, void *arg)
                                                fsm->user,
                                                file_size,
                                                replace,
+                                               mtime,
                                                &new_file_id,
                                                &error);
     if (rc < 0) {
@@ -779,6 +814,9 @@ upload_blks_api_cb(evhtp_request_t *req, void *arg)
                 error_code = ERROR_BLOCK_MISSING;
             } else if (error->code == POST_FILE_ERR_QUOTA_FULL) {
                 error_code = ERROR_QUOTA;
+            } else if (error->code == SEAF_ERR_GC_CONFLICT) {
+                error_code = -1;
+                send_error_reply (req, EVHTP_RES_CONFLICT, "GC Conflict.\n");
             }
             g_clear_error (&error);
         }
@@ -1051,6 +1089,8 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     char *parent_dir = NULL, *relative_path = NULL, *new_parent_dir = NULL;
+    char *last_modify = NULL;
+    gint64 mtime = 0;
     GError *error = NULL;
     int error_code = -1;
     char *filenames_json, *tmp_files_json;
@@ -1089,6 +1129,11 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
         seaf_debug ("[upload] No parent dir given.\n");
         send_error_reply (req, EVHTP_RES_BADREQ, "Invalid parent dir.");
         return;
+    }
+
+    last_modify = g_hash_table_lookup (fsm->form_kvs, "last_modify");
+    if (last_modify) {
+        mtime = rfc3339_to_timestamp (last_modify);
     }
 
     if (!fsm->filenames) {
@@ -1190,6 +1235,7 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
                                              tmp_files_json,
                                              fsm->user,
                                              0,
+                                             mtime,
                                              &ret_json,
                                              fsm->need_idx_progress ? &task_id : NULL,
                                              &error);
@@ -1203,6 +1249,9 @@ upload_ajax_cb(evhtp_request_t *req, void *arg)
             } else if (error->code == SEAF_ERR_FILES_WITH_SAME_NAME) {
                 error_code = -1;
                 send_error_reply (req, EVHTP_RES_BADREQ, "Too many files with same name.\n");
+            } else if (error->code == SEAF_ERR_GC_CONFLICT) {
+                error_code = -1;
+                send_error_reply (req, EVHTP_RES_CONFLICT, "GC Conflict.\n");
             }
             g_clear_error (&error);
         }
@@ -1236,6 +1285,8 @@ update_api_cb(evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     char *target_file, *parent_dir = NULL, *filename = NULL;
+    char *last_modify = NULL;
+    gint64 mtime = 0;
     const char *head_id = NULL;
     GError *error = NULL;
     int error_code = -1;
@@ -1276,6 +1327,11 @@ update_api_cb(evhtp_request_t *req, void *arg)
         seaf_debug ("[Update] No target file given.\n");
         send_error_reply (req, EVHTP_RES_BADREQ, "No target file.\n");
         return;
+    }
+
+    last_modify = g_hash_table_lookup (fsm->form_kvs, "last_modify");
+    if (last_modify) {
+        mtime = rfc3339_to_timestamp (last_modify);
     }
 
     parent_dir = g_path_get_dirname (target_file);
@@ -1348,6 +1404,7 @@ update_api_cb(evhtp_request_t *req, void *arg)
                                          filename,
                                          fsm->user,
                                          head_id,
+                                         mtime,
                                          &new_file_id,
                                          &error);
     if (rc < 0) {
@@ -1388,6 +1445,8 @@ update_blks_api_cb(evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     char *target_file, *parent_dir = NULL, *filename = NULL, *size_str = NULL;
+    char *last_modify = NULL;
+    gint64 mtime = 0;
     const char *commitonly_str;
     GError *error = NULL;
     int error_code = -1;
@@ -1409,6 +1468,11 @@ update_blks_api_cb(evhtp_request_t *req, void *arg)
     if (!commitonly_str) {
         send_error_reply (req, EVHTP_RES_BADREQ, "Only commit supported.\n");
         return;
+    }
+
+    last_modify = g_hash_table_lookup (fsm->form_kvs, "last_modify");
+    if (last_modify) {
+        mtime = rfc3339_to_timestamp (last_modify);
     }
 
     parent_dir = g_path_get_dirname (target_file);
@@ -1461,6 +1525,7 @@ update_blks_api_cb(evhtp_request_t *req, void *arg)
                                                fsm->user,
                                                file_size,
                                                1,
+                                               mtime,
                                                &new_file_id,
                                                &error);
 
@@ -1471,6 +1536,9 @@ update_blks_api_cb(evhtp_request_t *req, void *arg)
                 error_code = ERROR_NOT_EXIST;
             } else if (error->code == POST_FILE_ERR_QUOTA_FULL) {
                 error_code = ERROR_QUOTA;
+            } else if (error->code == SEAF_ERR_GC_CONFLICT) {
+                error_code = -1;
+                send_error_reply (req, EVHTP_RES_CONFLICT, "GC Conflict.\n");
             }
             g_clear_error (&error);
         }
@@ -1637,6 +1705,8 @@ update_ajax_cb(evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     char *target_file, *parent_dir = NULL, *filename = NULL;
+    char *last_modify = NULL;
+    gint64 mtime = 0;
     const char *head_id = NULL;
     GError *error = NULL;
     int error_code = -1;
@@ -1681,6 +1751,11 @@ update_ajax_cb(evhtp_request_t *req, void *arg)
         return;
     }
 
+    last_modify = g_hash_table_lookup (fsm->form_kvs, "last_modify");
+    if (last_modify) {
+        mtime = rfc3339_to_timestamp (last_modify);
+    }
+
     parent_dir = g_path_get_dirname (target_file);
     filename = g_path_get_basename (target_file);
 
@@ -1716,6 +1791,7 @@ update_ajax_cb(evhtp_request_t *req, void *arg)
                                          filename,
                                          fsm->user,
                                          head_id,
+                                         mtime,
                                          &new_file_id,
                                          &error);
 
@@ -1724,6 +1800,9 @@ update_ajax_cb(evhtp_request_t *req, void *arg)
         if (error) {
             if (g_strcmp0 (error->message, "file does not exist") == 0) {
                 error_code = ERROR_NOT_EXIST;
+            } else if (error->code == SEAF_ERR_GC_CONFLICT) {
+                error_code = -1;
+                send_error_reply (req, EVHTP_RES_CONFLICT, "GC Conflict.\n");
             }
             g_clear_error (&error);
         }
@@ -1746,11 +1825,21 @@ out:
     return;
 }
 
+/*
+static void
+upload_link_cb(evhtp_request_t *req, void *arg)
+{
+    return upload_api_cb (req, arg);
+}
+*/
+
 static evhtp_res
 upload_finish_cb (evhtp_request_t *req, void *arg)
 {
     RecvFSM *fsm = arg;
     GList *ptr;
+
+    seaf_metric_manager_in_flight_request_dec (seaf->metric_mgr);
 
     if (!fsm)
         return EVHTP_RES_OK;
@@ -2548,6 +2637,8 @@ upload_headers_cb (evhtp_request_t *req, evhtp_headers_t *hdr, void *arg)
         pthread_mutex_unlock (&pg_lock);
     }
 
+    seaf_metric_manager_in_flight_request_inc (seaf->metric_mgr);
+
     /* Set up per-request hooks, so that we can read file data piece by piece. */
     evhtp_set_hook (&req->hooks, evhtp_hook_on_read, upload_read_cb, fsm);
     evhtp_set_hook (&req->hooks, evhtp_hook_on_request_fini, upload_finish_cb, fsm);
@@ -2576,6 +2667,155 @@ err:
     g_strfreev (parts);
     return EVHTP_RES_OK;
 }
+
+/*
+static evhtp_res
+upload_link_headers_cb (evhtp_request_t *req, evhtp_headers_t *hdr, void *arg)
+{
+    char **parts = NULL;
+    char *token = NULL;
+    const char *repo_id = NULL, *parent_dir = NULL;
+    char *r_parent_dir = NULL;
+    char *norm_parent_dir = NULL;
+    char *user = NULL;
+    char *boundary = NULL;
+    gint64 content_len;
+    char *progress_id = NULL;
+    char *err_msg = NULL;
+    RecvFSM *fsm = NULL;
+    Progress *progress = NULL;
+    int error_code = EVHTP_RES_BADREQ;
+    SeafileShareLinkInfo *info = NULL;
+
+    if (!seaf->seahub_pk) {
+        seaf_warning ("No seahub private key is configured.\n");
+        return EVHTP_RES_NOTFOUND;
+    }
+
+    if (evhtp_request_get_method(req) == htp_method_OPTIONS) {
+         return EVHTP_RES_OK;
+    }
+
+    token = req->uri->path->file;
+    if (!token) {
+        seaf_debug ("[upload] No token in url.\n");
+        err_msg = "No token in url";
+        goto err;
+    }
+
+    parts = g_strsplit (req->uri->path->full + 1, "/", 0);
+    if (!parts || g_strv_length (parts) < 2) {
+        err_msg = "Invalid URL";
+        goto err;
+    }
+
+    info = http_tx_manager_query_access_token (token, "upload");
+    if (!info) {
+        err_msg = "Access token not found\n";
+        error_code = EVHTP_RES_FORBIDDEN;
+        goto err;
+    }
+    repo_id = seafile_share_link_info_get_repo_id (info);
+    parent_dir = seafile_share_link_info_get_parent_dir (info);
+    if (!parent_dir) {
+        err_msg = "No parent_dir\n";
+        goto err;
+    }
+    norm_parent_dir = normalize_utf8_path (parent_dir); 
+    r_parent_dir = format_dir_path (norm_parent_dir);
+
+    user = seaf_repo_manager_get_repo_owner (seaf->repo_mgr, repo_id);
+
+    boundary = get_boundary (hdr);
+    if (!boundary) {
+        err_msg = "Wrong boundary in url";
+        goto err;
+    }
+
+    if (get_progress_info (req, hdr, &content_len, &progress_id) < 0) {
+        err_msg = "No progress info";
+        goto err;
+    }
+
+    if (progress_id != NULL) {
+        pthread_mutex_lock (&pg_lock);
+        if (g_hash_table_lookup (upload_progress, progress_id)) {
+            pthread_mutex_unlock (&pg_lock);
+            err_msg = "Duplicate progress id.\n";
+            goto err;
+        }
+        pthread_mutex_unlock (&pg_lock);
+    }
+
+    gint64 rstart = -1;
+    gint64 rend = -1;
+    gint64 fsize = -1;
+    if (!parse_range_val (hdr, &rstart, &rend, &fsize)) {
+        seaf_warning ("Invalid Seafile-Content-Range value.\n");
+        err_msg = "Invalid Seafile-Content-Range";
+        goto err;
+    }
+
+    fsm = g_new0 (RecvFSM, 1);
+    fsm->boundary = boundary;
+    fsm->repo_id = g_strdup (repo_id);
+    fsm->parent_dir = r_parent_dir;
+    fsm->user = user;
+    fsm->token_type = "upload-link";
+    fsm->rstart = rstart;
+    fsm->rend = rend;
+    fsm->fsize = fsize;
+    fsm->line = evbuffer_new ();
+    fsm->form_kvs = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                           g_free, g_free);
+    // const char *need_idx_progress = evhtp_kv_find (req->uri->query, "need_idx_progress");
+    // if (g_strcmp0(need_idx_progress, "true") == 0) 
+    //     fsm->need_idx_progress = TRUE; 
+    fsm->need_idx_progress = FALSE;
+
+    if (progress_id != NULL) {
+        progress = g_new0 (Progress, 1);
+        progress->size = content_len;
+        fsm->progress_id = progress_id;
+        fsm->progress = progress;
+
+        pthread_mutex_lock (&pg_lock);
+        g_hash_table_insert (upload_progress, g_strdup(progress_id), progress);
+        pthread_mutex_unlock (&pg_lock);
+    }
+
+    // Set up per-request hooks, so that we can read file data piece by piece.
+    evhtp_set_hook (&req->hooks, evhtp_hook_on_read, upload_read_cb, fsm);
+    evhtp_set_hook (&req->hooks, evhtp_hook_on_request_fini, upload_finish_cb, fsm);
+    // Set arg for upload_cb or update_cb.
+    req->cbarg = fsm;
+
+    g_free (norm_parent_dir);
+    g_strfreev (parts);
+    g_object_unref (info);
+
+    return EVHTP_RES_OK;
+
+err:
+    // Don't receive any data before the connection is closed.
+    // evhtp_request_pause (req);
+
+    // Set keepalive to 0. This will cause evhtp to close the
+    // connection after sending the reply.
+    req->keepalive = 0;
+    send_error_reply (req, error_code, err_msg);
+
+    g_free (norm_parent_dir);
+    g_free (r_parent_dir);
+    g_free (user);
+    g_free (boundary);
+    g_free (progress_id);
+    g_strfreev (parts);
+    if (info)
+        g_object_unref (info);
+    return EVHTP_RES_OK;
+}
+*/
 
 static void
 idx_progress_cb(evhtp_request_t *req, void *arg)
@@ -2692,6 +2932,10 @@ upload_file_init (evhtp_t *htp, const char *http_temp_dir)
 
     cb = evhtp_set_regex_cb (htp, "^/update-aj/.*", update_ajax_cb, NULL);
     evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, upload_headers_cb, NULL);
+
+    // upload links
+    // cb = evhtp_set_regex_cb (htp, "^/u/.*", upload_link_cb, NULL);
+    //evhtp_set_hook(&cb->hooks, evhtp_hook_on_headers, upload_link_headers_cb, NULL);
 
     evhtp_set_regex_cb (htp, "^/upload_progress.*", upload_progress_cb, NULL);
 

@@ -5,31 +5,29 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"database/sql"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/gorilla/mux"
 	"github.com/haiwen/seafile-server/fileserver/blockmgr"
 	"github.com/haiwen/seafile-server/fileserver/commitmgr"
 	"github.com/haiwen/seafile-server/fileserver/fsmgr"
+	"github.com/haiwen/seafile-server/fileserver/metrics"
 	"github.com/haiwen/seafile-server/fileserver/option"
 	"github.com/haiwen/seafile-server/fileserver/repomgr"
 	"github.com/haiwen/seafile-server/fileserver/searpc"
 	"github.com/haiwen/seafile-server/fileserver/share"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/haiwen/seafile-server/fileserver/utils"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/ini.v1"
 
@@ -43,11 +41,9 @@ var rpcPipePath string
 var pidFilePath string
 var logFp *os.File
 
-var dbType string
-var seafileDB, ccnetDB, seahubDB *sql.DB
+var seafileDB, ccnetDB *sql.DB
 
-// when SQLite is used, user and group db are separated.
-var userDB, groupDB *sql.DB
+var logToStdout bool
 
 func init() {
 	flag.StringVar(&centralDir, "F", "", "central config directory")
@@ -55,6 +51,11 @@ func init() {
 	flag.StringVar(&logFile, "l", "", "log file path")
 	flag.StringVar(&rpcPipePath, "p", "", "rpc pipe path")
 	flag.StringVar(&pidFilePath, "P", "", "pid file path")
+
+	env := os.Getenv("SEAFILE_LOG_TO_STDOUT")
+	if env == "true" {
+		logToStdout = true
+	}
 
 	log.SetFormatter(&LogFormatter{})
 }
@@ -66,107 +67,194 @@ const (
 type LogFormatter struct{}
 
 func (f *LogFormatter) Format(entry *log.Entry) ([]byte, error) {
-	buf := make([]byte, 0, len(timestampFormat)+len(entry.Message)+1)
+	levelStr := entry.Level.String()
+	if levelStr == "fatal" {
+		levelStr = "ERROR"
+	} else {
+		levelStr = strings.ToUpper(levelStr)
+	}
+	level := fmt.Sprintf("[%s] ", levelStr)
+	appName := ""
+	if logToStdout {
+		appName = "[fileserver] "
+	}
+	buf := make([]byte, 0, len(appName)+len(timestampFormat)+len(level)+len(entry.Message)+1)
+	if logToStdout {
+		buf = append(buf, appName...)
+	}
 	buf = entry.Time.AppendFormat(buf, timestampFormat)
+	buf = append(buf, level...)
 	buf = append(buf, entry.Message...)
 	buf = append(buf, '\n')
 	return buf, nil
 }
 
 func loadCcnetDB() {
-	ccnetConfPath := filepath.Join(centralDir, "ccnet.conf")
+	dbOpt, err := loadDBOption()
+	if err != nil {
+		log.Fatalf("Failed to load database: %v", err)
+	}
+
+	var dsn string
+	timeout := "&readTimeout=60s" + "&writeTimeout=60s"
+	if dbOpt.UseTLS && dbOpt.SkipVerify {
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, timeout)
+	} else if dbOpt.UseTLS && !dbOpt.SkipVerify {
+		registerCA(dbOpt.CaPath)
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, timeout)
+	} else {
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, dbOpt.UseTLS, timeout)
+	}
+	if dbOpt.Charset != "" {
+		dsn = fmt.Sprintf("%s&charset=%s", dsn, dbOpt.Charset)
+	}
+	ccnetDB, err = sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	ccnetDB.SetConnMaxLifetime(5 * time.Minute)
+	ccnetDB.SetMaxOpenConns(8)
+	ccnetDB.SetMaxIdleConns(8)
+}
+
+func loadDBOption() (*DBOption, error) {
+	dbOpt, err := loadDBOptionFromFile()
+	if err != nil {
+		log.Warnf("failed to load database config: %v", err)
+	}
+	dbOpt = loadDBOptionFromEnv(dbOpt)
+
+	if dbOpt.Host == "" {
+		return nil, fmt.Errorf("no database host in seafile.conf.")
+	}
+	if dbOpt.User == "" {
+		return nil, fmt.Errorf("no database user in seafile.conf.")
+	}
+	if dbOpt.Password == "" {
+		return nil, fmt.Errorf("no database password in seafile.conf.")
+	}
+
+	return dbOpt, nil
+}
+
+type DBOption struct {
+	User          string
+	Password      string
+	Host          string
+	Port          int
+	CcnetDbName   string
+	SeafileDbName string
+	CaPath        string
+	UseTLS        bool
+	SkipVerify    bool
+	Charset       string
+}
+
+func loadDBOptionFromEnv(dbOpt *DBOption) *DBOption {
+	user := os.Getenv("SEAFILE_MYSQL_DB_USER")
+	password := os.Getenv("SEAFILE_MYSQL_DB_PASSWORD")
+	host := os.Getenv("SEAFILE_MYSQL_DB_HOST")
+	ccnetDbName := os.Getenv("SEAFILE_MYSQL_DB_CCNET_DB_NAME")
+	seafileDbName := os.Getenv("SEAFILE_MYSQL_DB_SEAFILE_DB_NAME")
+
+	if dbOpt == nil {
+		dbOpt = new(DBOption)
+	}
+	if user != "" {
+		dbOpt.User = user
+	}
+	if password != "" {
+		dbOpt.Password = password
+	}
+	if host != "" {
+		dbOpt.Host = host
+	}
+	if dbOpt.Port == 0 {
+		dbOpt.Port = 3306
+	}
+	if ccnetDbName != "" {
+		dbOpt.CcnetDbName = ccnetDbName
+	} else if dbOpt.CcnetDbName == "" {
+		dbOpt.CcnetDbName = "ccnet_db"
+		log.Infof("Failed to read SEAFILE_MYSQL_DB_CCNET_DB_NAME, use ccnet_db by default")
+	}
+	if seafileDbName != "" {
+		dbOpt.SeafileDbName = seafileDbName
+	} else if dbOpt.SeafileDbName == "" {
+		dbOpt.SeafileDbName = "seafile_db"
+		log.Infof("Failed to read SEAFILE_MYSQL_DB_SEAFILE_DB_NAME, use seafile_db by default")
+	}
+	return dbOpt
+}
+
+func loadDBOptionFromFile() (*DBOption, error) {
+	dbOpt := new(DBOption)
+
+	seafileConfPath := filepath.Join(centralDir, "seafile.conf")
 	opts := ini.LoadOptions{}
 	opts.SpaceBeforeInlineComment = true
-	config, err := ini.LoadSources(opts, ccnetConfPath)
+	config, err := ini.LoadSources(opts, seafileConfPath)
 	if err != nil {
-		log.Fatalf("Failed to load ccnet.conf: %v", err)
+		return nil, fmt.Errorf("failed to load seafile.conf: %v", err)
 	}
 
-	section, err := config.GetSection("Database")
+	section, err := config.GetSection("database")
 	if err != nil {
-		log.Fatal("No database section in ccnet.conf.")
+		return nil, fmt.Errorf("no database section in seafile.conf.")
 	}
 
-	var dbEngine string = "sqlite"
-	key, err := section.GetKey("ENGINE")
+	dbEngine := ""
+	key, err := section.GetKey("type")
 	if err == nil {
 		dbEngine = key.String()
 	}
-
-	if strings.EqualFold(dbEngine, "mysql") {
-		unixSocket := ""
-		if key, err = section.GetKey("UNIX_SOCKET"); err == nil {
-			unixSocket = key.String()
-		}
-		host := ""
-		if key, err = section.GetKey("HOST"); err == nil {
-			host = key.String()
-		} else if unixSocket == "" {
-			log.Fatal("No database host in ccnet.conf.")
-		}
-		// user is required.
-		if key, err = section.GetKey("USER"); err != nil {
-			log.Fatal("No database user in ccnet.conf.")
-		}
-		user := key.String()
-		password := ""
-		if key, err = section.GetKey("PASSWD"); err == nil {
-			password = key.String()
-		} else if unixSocket == "" {
-			log.Fatal("No database password in ccnet.conf.")
-		}
-		if key, err = section.GetKey("DB"); err != nil {
-			log.Fatal("No database db_name in ccnet.conf.")
-		}
-		dbName := key.String()
-		port := 3306
-		if key, err = section.GetKey("PORT"); err == nil {
-			port, _ = key.Int()
-		}
-		useTLS := false
-		if key, err = section.GetKey("USE_SSL"); err == nil {
-			useTLS, _ = key.Bool()
-		}
-		skipVerify := false
-		if key, err = section.GetKey("SKIP_VERIFY"); err == nil {
-			skipVerify, _ = key.Bool()
-		}
-		var dsn string
-		if unixSocket == "" {
-			if useTLS && skipVerify {
-				dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify", user, password, host, port, dbName)
-			} else if useTLS && !skipVerify {
-				capath := ""
-				if key, err = section.GetKey("CA_PATH"); err == nil {
-					capath = key.String()
-				}
-				registerCA(capath)
-				dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom", user, password, host, port, dbName)
-			} else {
-				dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t", user, password, host, port, dbName, useTLS)
-			}
-		} else {
-			dsn = fmt.Sprintf("%s:%s@unix(%s)/%s", user, password, unixSocket, dbName)
-		}
-		ccnetDB, err = sql.Open("mysql", dsn)
-		if err != nil {
-			log.Fatalf("Failed to open database: %v", err)
-		}
-	} else if strings.EqualFold(dbEngine, "sqlite") {
-		ccnetDBPath := filepath.Join(centralDir, "groupmgr.db")
-		ccnetDB, err = sql.Open("sqlite3", ccnetDBPath)
-		if err != nil {
-			log.Fatalf("Failed to open database %s: %v", ccnetDBPath, err)
-		}
-	} else {
-		log.Fatalf("Unsupported database %s.", dbEngine)
+	if dbEngine != "mysql" {
+		return nil, fmt.Errorf("unsupported database %s.", dbEngine)
 	}
+	if key, err = section.GetKey("host"); err == nil {
+		dbOpt.Host = key.String()
+	}
+	// user is required.
+	if key, err = section.GetKey("user"); err == nil {
+		dbOpt.User = key.String()
+	}
+
+	if key, err = section.GetKey("password"); err == nil {
+		dbOpt.Password = key.String()
+	}
+
+	if key, err = section.GetKey("db_name"); err == nil {
+		dbOpt.SeafileDbName = key.String()
+	}
+	port := 3306
+	if key, err = section.GetKey("port"); err == nil {
+		port, _ = key.Int()
+	}
+	dbOpt.Port = port
+	useTLS := false
+	if key, err = section.GetKey("use_ssl"); err == nil {
+		useTLS, _ = key.Bool()
+	}
+	dbOpt.UseTLS = useTLS
+	skipVerify := false
+	if key, err = section.GetKey("skip_verify"); err == nil {
+		skipVerify, _ = key.Bool()
+	}
+	dbOpt.SkipVerify = skipVerify
+	if key, err = section.GetKey("ca_path"); err == nil {
+		dbOpt.CaPath = key.String()
+	}
+	if key, err = section.GetKey("connection_charset"); err == nil {
+		dbOpt.Charset = key.String()
+	}
+
+	return dbOpt, nil
 }
 
 // registerCA registers CA to verify server cert.
 func registerCA(capath string) {
 	rootCertPool := x509.NewCertPool()
-	pem, err := ioutil.ReadFile(capath)
+	pem, err := os.ReadFile(capath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -179,160 +267,32 @@ func registerCA(capath string) {
 }
 
 func loadSeafileDB() {
-	seafileConfPath := filepath.Join(centralDir, "seafile.conf")
-
-	opts := ini.LoadOptions{}
-	opts.SpaceBeforeInlineComment = true
-	config, err := ini.LoadSources(opts, seafileConfPath)
+	dbOpt, err := loadDBOption()
 	if err != nil {
-		log.Fatalf("Failed to load seafile.conf: %v", err)
+		log.Fatalf("Failed to load database: %v", err)
 	}
 
-	section, err := config.GetSection("database")
-	if err != nil {
-		log.Fatal("No database section in seafile.conf.")
-	}
-
-	var dbEngine string = "sqlite"
-	key, err := section.GetKey("type")
-	if err == nil {
-		dbEngine = key.String()
-	}
-	if strings.EqualFold(dbEngine, "mysql") {
-		unixSocket := ""
-		if key, err = section.GetKey("unix_socket"); err == nil {
-			unixSocket = key.String()
-		}
-		host := ""
-		if key, err = section.GetKey("host"); err == nil {
-			host = key.String()
-		} else if unixSocket == "" {
-			log.Fatal("No database host in seafile.conf.")
-		}
-		// user is required.
-		if key, err = section.GetKey("user"); err != nil {
-			log.Fatal("No database user in seafile.conf.")
-		}
-		user := key.String()
-
-		password := ""
-		if key, err = section.GetKey("password"); err == nil {
-			password = key.String()
-		} else if unixSocket == "" {
-			log.Fatal("No database password in seafile.conf.")
-		}
-		if key, err = section.GetKey("db_name"); err != nil {
-			log.Fatal("No database db_name in seafile.conf.")
-		}
-		dbName := key.String()
-		port := 3306
-		if key, err = section.GetKey("port"); err == nil {
-			port, _ = key.Int()
-		}
-		useTLS := false
-		if key, err = section.GetKey("use_ssl"); err == nil {
-			useTLS, _ = key.Bool()
-		}
-		skipVerify := false
-		if key, err = section.GetKey("skip_verify"); err == nil {
-			skipVerify, _ = key.Bool()
-		}
-
-		var dsn string
-		if unixSocket == "" {
-			if useTLS && skipVerify {
-				dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify", user, password, host, port, dbName)
-			} else if useTLS && !skipVerify {
-				capath := ""
-				if key, err = section.GetKey("ca_path"); err == nil {
-					capath = key.String()
-				}
-				registerCA(capath)
-				dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom", user, password, host, port, dbName)
-			} else {
-				dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t", user, password, host, port, dbName, useTLS)
-			}
-		} else {
-			dsn = fmt.Sprintf("%s:%s@unix(%s)/%s", user, password, unixSocket, dbName)
-		}
-
-		seafileDB, err = sql.Open("mysql", dsn)
-		if err != nil {
-			log.Fatalf("Failed to open database: %v", err)
-		}
-	} else if strings.EqualFold(dbEngine, "sqlite") {
-		seafileDBPath := filepath.Join(absDataDir, "seafile.db")
-		seafileDB, err = sql.Open("sqlite3", seafileDBPath)
-		if err != nil {
-			log.Fatalf("Failed to open database %s: %v", seafileDBPath, err)
-		}
+	var dsn string
+	timeout := "&readTimeout=60s" + "&writeTimeout=60s"
+	if dbOpt.UseTLS && dbOpt.SkipVerify {
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, timeout)
+	} else if dbOpt.UseTLS && !dbOpt.SkipVerify {
+		registerCA(dbOpt.CaPath)
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, timeout)
 	} else {
-		log.Fatalf("Unsupported database %s.", dbEngine)
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, dbOpt.UseTLS, timeout)
 	}
-	dbType = dbEngine
-}
+	if dbOpt.Charset != "" {
+		dsn = fmt.Sprintf("%s&charset=%s", dsn, dbOpt.Charset)
+	}
 
-func loadSeahubDB() {
-	scriptPath, err := exec.LookPath("parse_seahub_db.py")
+	seafileDB, err = sql.Open("mysql", dsn)
 	if err != nil {
-		log.Warnf("Failed to find script of parse_seahub_db.py: %v", err)
-		return
+		log.Fatalf("Failed to open database: %v", err)
 	}
-	cmd := exec.Command("python3", scriptPath)
-	dbData, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Warnf("Failed to run python parse_seahub_db.py: %v", err)
-		return
-	}
-
-	dbConfig := make(map[string]string)
-
-	err = json.Unmarshal(dbData, &dbConfig)
-	if err != nil {
-		log.Warnf("Failed to decode seahub database json file: %v", err)
-		return
-	}
-
-	dbEngine := dbConfig["ENGINE"]
-	dbName := dbConfig["NAME"]
-	user := dbConfig["USER"]
-	password := dbConfig["PASSWORD"]
-	host := dbConfig["HOST"]
-	portStr := dbConfig["PORT"]
-
-	if strings.Index(dbEngine, "mysql") >= 0 {
-		port, err := strconv.ParseInt(portStr, 10, 64)
-		if err != nil || port <= 0 {
-			port = 3306
-		}
-		if dbName == "" {
-			log.Warnf("Seahub DB name not set in config")
-			return
-		}
-		if user == "" {
-			log.Warnf("Seahub DB user not set in config")
-			return
-		}
-		if password == "" {
-			log.Warnf("Seahub DB password not set in config")
-			return
-		}
-		if host == "" {
-			log.Warnf("Seahub DB host not set in config")
-			return
-		}
-
-		dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t", user, password, host, port, dbName, false)
-
-		seahubDB, err = sql.Open("mysql", dsn)
-		if err != nil {
-			log.Warnf("Failed to open database: %v", err)
-		}
-	} else if strings.Index(dbEngine, "sqlite") >= 0 {
-		return
-	} else {
-		log.Warnf("Unsupported database %s.", dbEngine)
-	}
+	seafileDB.SetConnMaxLifetime(5 * time.Minute)
+	seafileDB.SetMaxOpenConns(8)
+	seafileDB.SetMaxIdleConns(8)
 }
 
 func writePidFile(pid_file_path string) error {
@@ -392,7 +352,9 @@ func main() {
 	loadSeafileDB()
 	option.LoadFileServerOptions(centralDir)
 
-	if logFile == "" {
+	if logToStdout {
+		// Use default output (StdOut)
+	} else if logFile == "" {
 		absLogFile = filepath.Join(absDataDir, "fileserver.log")
 		fp, err := os.OpenFile(absLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 		if err != nil {
@@ -412,6 +374,10 @@ func main() {
 		logFp = fp
 		log.SetOutput(fp)
 	}
+
+	if absLogFile != "" && !logToStdout {
+		utils.Dup(int(logFp.Fd()), int(os.Stderr.Fd()))
+	}
 	// When logFile is "-", use default output (StdOut)
 
 	level, err := log.ParseLevel(option.LogLevel)
@@ -422,18 +388,9 @@ func main() {
 		log.SetLevel(level)
 	}
 
-	if absLogFile != "" {
-		errorLogFile := filepath.Join(filepath.Dir(absLogFile), "fileserver-error.log")
-		fp, err := os.OpenFile(errorLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-		if err != nil {
-			log.Fatalf("Failed to open or create error log file: %v", err)
-		}
-		syscall.Dup3(int(fp.Fd()), int(os.Stderr.Fd()), 0)
-		// We need to close the old fp, because it has beed duped.
-		fp.Close()
+	if err := option.LoadSeahubConfig(); err != nil {
+		log.Fatalf("Failed to read seahub config: %v", err)
 	}
-
-	loadSeahubDB()
 
 	repomgr.Init(seafileDB)
 
@@ -457,6 +414,8 @@ func main() {
 
 	initUpload()
 
+	metrics.Init()
+
 	router := newHTTPRouter()
 
 	go handleSignals()
@@ -464,10 +423,13 @@ func main() {
 
 	log.Print("Seafile file server started.")
 
-	addr := fmt.Sprintf("%s:%d", option.Host, option.Port)
-	err = http.ListenAndServe(addr, router)
+	server := new(http.Server)
+	server.Addr = fmt.Sprintf("%s:%d", option.Host, option.Port)
+	server.Handler = router
+
+	err = server.ListenAndServe()
 	if err != nil {
-		log.Printf("File server exiting: %v", err)
+		log.Errorf("File server exiting: %v", err)
 	}
 }
 
@@ -475,6 +437,7 @@ func handleSignals() {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM, os.Interrupt)
 	<-signalChan
+	metrics.Stop()
 	removePidfile(pidFilePath)
 	os.Exit(0)
 }
@@ -482,17 +445,17 @@ func handleSignals() {
 func handleUser1Signal() {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGUSR1)
-	<-signalChan
 
 	for {
-		select {
-		case <-signalChan:
-			logRotate()
-		}
+		<-signalChan
+		logRotate()
 	}
 }
 
 func logRotate() {
+	if logToStdout {
+		return
+	}
 	// reopen fileserver log
 	fp, err := os.OpenFile(absLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
 	if err != nil {
@@ -504,13 +467,7 @@ func logRotate() {
 		logFp = fp
 	}
 
-	errorLogFile := filepath.Join(filepath.Dir(absLogFile), "fileserver-error.log")
-	errFp, err := os.OpenFile(errorLogFile, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
-	if err != nil {
-		log.Fatalf("Failed to reopen fileserver error log: %v", err)
-	}
-	syscall.Dup3(int(errFp.Fd()), int(os.Stderr.Fd()), 0)
-	errFp.Close()
+	utils.Dup(int(logFp.Fd()), int(os.Stderr.Fd()))
 }
 
 var rpcclient *searpc.Client
@@ -537,6 +494,14 @@ func newHTTPRouter() *mux.Router {
 	r.Handle("/update-aj/{.*}", appHandler(updateAjaxCB))
 	r.Handle("/upload-blks-api/{.*}", appHandler(uploadBlksAPICB))
 	r.Handle("/upload-raw-blks-api/{.*}", appHandler(uploadRawBlksAPICB))
+
+	// links api
+	//r.Handle("/u/{.*}", appHandler(uploadLinkCB))
+	r.Handle("/f/{.*}{slash:\\/?}", appHandler(accessLinkCB))
+	//r.Handle("/d/{.*}", appHandler(accessDirLinkCB))
+
+	r.Handle("/repos/{repoid:[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}}/files/{filepath:.*}", appHandler(accessV2CB))
+
 	// file syncing api
 	r.Handle("/repo/{repoid:[\\da-z]{8}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{4}-[\\da-z]{12}}/permission-check{slash:\\/?}",
 		appHandler(permissionCheckCB))
@@ -578,6 +543,10 @@ func newHTTPRouter() *mux.Router {
 	r.Handle("/debug/pprof/goroutine", &profileHandler{pprof.Handler("goroutine")})
 	r.Handle("/debug/pprof/threadcreate", &profileHandler{pprof.Handler("threadcreate")})
 	r.Handle("/debug/pprof/trace", &traceHandler{})
+
+	if option.HasRedisOptions {
+		r.Use(metrics.MetricMiddleware)
+	}
 	return r
 }
 
@@ -596,7 +565,7 @@ type appHandler func(http.ResponseWriter, *http.Request) *appError
 func (fn appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if e := fn(w, r); e != nil {
 		if e.Error != nil && e.Code == http.StatusInternalServerError {
-			log.Printf("path %s internal server error: %v\n", r.URL.Path, e.Error)
+			log.Errorf("path %s internal server error: %v\n", r.URL.Path, e.Error)
 		}
 		http.Error(w, e.Message, e.Code)
 	}
@@ -605,7 +574,7 @@ func (fn appHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func RecoverWrapper(f func()) {
 	defer func() {
 		if err := recover(); err != nil {
-			log.Printf("panic: %v\n%s", err, debug.Stack())
+			log.Errorf("panic: %v\n%s", err, debug.Stack())
 		}
 	}()
 
